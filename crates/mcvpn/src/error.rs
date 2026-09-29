@@ -8,6 +8,11 @@ pub enum VpnError {
     Mc(#[from] mc_protocol::McError),
     #[error("kicked from server: {0}")]
     Kick(String),
+    /// The server closed the tunnel cleanly (restart/update/deploy). A kick
+    /// for a policy reason (bad token, full server) needs the user; a clean
+    /// close is exactly the case auto-reconnect exists for.
+    #[error("closed by server")]
+    Closed,
     #[error("timed out")]
     Timeout,
     #[error("authentication failed")]
@@ -38,6 +43,7 @@ impl VpnError {
             VpnError::Io(_)
                 | VpnError::Timeout
                 | VpnError::Shutdown
+                | VpnError::Closed
                 | VpnError::Mc(_)
                 | VpnError::Crypto(_)
         )

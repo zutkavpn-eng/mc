@@ -458,7 +458,11 @@ impl Connected {
                 body = body_rx.recv() => {
                     let Some(body) = body else {
                         device.stop_device();
-                        return Err(VpnError::Kick("closed by server".into()));
+                        // The reader pump ends on EOF: the server (or the
+                        // path to it) went away mid-stream — retryable.
+                        return Err(VpnError::Io(
+                            std::io::ErrorKind::UnexpectedEof.into(),
+                        ));
                     };
                     match body[0] {
                         play_id::CB_KEEP_ALIVE => {
@@ -518,7 +522,7 @@ impl Connected {
                                                  disabling caps for this process"
                                             );
                                         }
-                                        return Err(VpnError::Kick("closed by server".into()));
+                                        return Err(VpnError::Closed);
                                     }
                                     tunnel::TunnelMsg::Unknown => {}
                                     _ => {}
