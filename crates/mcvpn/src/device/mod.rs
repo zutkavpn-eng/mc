@@ -1,11 +1,32 @@
 //! IP device abstraction: a pair of channels plus a background thread
 //! shuttling packets to/from the OS device (TUN / wintun / Android fd).
 
+use std::time::Instant;
 use tokio::sync::mpsc;
+
+/// A device packet with its enqueue time. The AQM (CoDel-style sojourn
+/// limit, see `tunnel::MAX_QUEUED_MS`) drops packets that have waited in a
+/// backed-up link's queue too long instead of letting a slow radio
+/// accumulate seconds of standing queue — loss the inner TCP flows read as
+/// congestion, which is exactly the signal they need to converge on the
+/// link's real rate.
+pub struct TimedPkt {
+    pub pkt: Vec<u8>,
+    pub ts: Instant,
+}
+
+impl TimedPkt {
+    pub fn now(pkt: Vec<u8>) -> Self {
+        Self {
+            pkt,
+            ts: Instant::now(),
+        }
+    }
+}
 
 pub struct DeviceHandle {
     /// Packets read from the device (ready to be sent into the tunnel).
-    pub inbox: mpsc::Receiver<Vec<u8>>,
+    pub inbox: mpsc::Receiver<TimedPkt>,
     /// Packets from the tunnel, to be written into the device.
     pub outbox: mpsc::Sender<Vec<u8>>,
     pub name: String,

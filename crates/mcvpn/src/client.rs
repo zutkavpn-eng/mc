@@ -2,8 +2,8 @@
 //! loop that moves IP packets between the device and the MW|Tunnel channel.
 
 use crate::config::ClientConfig;
-use crate::conn::Conn;
-use crate::device::DeviceHandle;
+use crate::conn::{spawn_reader_pump, Conn, ConnSender};
+use crate::device::{DeviceHandle, TimedPkt};
 use crate::error::{VpnError, VpnResult};
 use crate::stats::{SharedStats, Stats};
 use crate::tunnel::{self, Role, TunnelCrypto, TunnelInfo};
@@ -11,8 +11,15 @@ use mc_protocol::packets::{self, play_id, CustomPayload, Handshake};
 use mc_protocol::{login_crypto, PROTOCOL_VERSION};
 use rand::RngCore;
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+
+/// Set when a server kicked us for announcing caps (a pre-0.1.6 server kicks
+/// on unknown tunnel messages): stops announcing for the rest of this
+/// process, so auto-reconnect cannot loop on the kick. Older servers then
+/// get plain single-packet DATA frames only, which they fully understand.
+static CAPS_SUPPRESSED: AtomicBool = AtomicBool::new(false);
 use tokio::sync::watch;
 
 /// TEST-NET-2 (RFC 5737) address used only to prove routing: never routed on
@@ -39,6 +46,10 @@ pub struct Connected {
     pub info: TunnelInfo,
     pub stats: SharedStats,
     cfg: ClientConfig,
+    /// MSG_CAPS was sent on this connection.
+    announced_caps: bool,
+    /// The server acknowledged CAPS_BATCH (uplink batching is allowed).
+    caps_acked: bool,
 }
 
 async fn recv_timeout(conn: &mut Conn, d: Duration) -> VpnResult<Vec<u8>> {
@@ -57,19 +68,20 @@ async fn recv_timeout(conn: &mut Conn, d: Duration) -> VpnResult<Vec<u8>> {
 /// rather than draining the whole queue, keeps keep-alive, ping and server
 /// packets responsive while a bulk transfer is running.
 async fn send_one_batch(
-    conn: &mut Conn,
+    conn: &mut ConnSender,
     crypto: &mut TunnelCrypto,
     device: &mut DeviceHandle,
     stats: &Stats,
-    first: Vec<u8>,
-    held: &mut Option<Vec<u8>>,
+    first: TimedPkt,
+    held: &mut Option<TimedPkt>,
+    allow_batch: bool,
 ) -> VpnResult<()> {
     let mut batch = vec![first];
-    let mut bytes = batch[0].len();
-    while batch.len() < tunnel::MAX_BATCH_PKTS {
+    let mut bytes = batch[0].pkt.len();
+    while allow_batch && batch.len() < tunnel::MAX_BATCH_PKTS {
         match device.inbox.try_recv() {
-            Ok(p) if bytes + p.len() <= tunnel::MAX_UPLINK_BYTES => {
-                bytes += p.len();
+            Ok(p) if bytes + p.pkt.len() <= tunnel::MAX_UPLINK_BYTES => {
+                bytes += p.pkt.len();
                 batch.push(p);
             }
             Ok(p) => {
@@ -79,7 +91,22 @@ async fn send_one_batch(
             Err(_) => break,
         }
     }
-    for ip_packet in &batch {
+    // AQM: drop packets that waited too long in a backed-up uplink queue;
+    // the inner TCP flows read that loss as congestion and back off to the
+    // radio's real rate (CoDel-style), instead of the queue growing without
+    // bound and inflating every flow's RTT through it.
+    let mut kept: Vec<Vec<u8>> = Vec::with_capacity(batch.len());
+    for tp in batch.drain(..) {
+        if tunnel::aqm_enabled() && tp.ts.elapsed().as_millis() as u64 > tunnel::MAX_QUEUED_MS {
+            stats.add_drop();
+        } else {
+            kept.push(tp.pkt);
+        }
+    }
+    if kept.is_empty() {
+        return Ok(());
+    }
+    for ip_packet in &kept {
         if ip_packet.len() >= 20 && ip_packet[16..20] == PROBE_ADDR {
             stats
                 .probe_seen
@@ -87,10 +114,10 @@ async fn send_one_batch(
         }
         stats.add_up(ip_packet.len() as u64);
     }
-    let sealed = if batch.len() == 1 {
-        crypto.seal(&batch[0]).map(tunnel::encode_data)
+    let sealed = if kept.len() == 1 {
+        crypto.seal(&kept[0]).map(tunnel::encode_data)
     } else {
-        crypto.seal_batch(&batch).map(tunnel::encode_data_batch)
+        crypto.seal_batch(&kept).map(tunnel::encode_data_batch)
     }?;
     let cp = CustomPayload {
         channel: packets::CHANNEL_TUNNEL.into(),
@@ -117,12 +144,31 @@ pub fn plain_reason(json: &str) -> String {
 /// Perform the full Minecraft login + tunnel auth. On success the caller
 /// creates the local device using `info` and calls `attach_device`.
 pub async fn connect(cfg: &ClientConfig) -> VpnResult<Connected> {
-    connect_with_stats(cfg, Arc::new(Stats::default())).await
+    connect_impl(
+        cfg,
+        Arc::new(Stats::default()),
+        !CAPS_SUPPRESSED.load(Ordering::Relaxed),
+    )
+    .await
+}
+
+/// Same as [`connect`], but emulates a pre-0.1.6 client on the wire: no caps
+/// announcement, so the server must never batch toward it (compat test).
+pub async fn connect_no_caps(cfg: &ClientConfig) -> VpnResult<Connected> {
+    connect_impl(cfg, Arc::new(Stats::default()), false).await
 }
 
 /// Same as [`connect`] but reports into a caller-provided stats holder
 /// (GUIs and drivers observe live numbers).
 pub async fn connect_with_stats(cfg: &ClientConfig, stats: SharedStats) -> VpnResult<Connected> {
+    connect_impl(cfg, stats, !CAPS_SUPPRESSED.load(Ordering::Relaxed)).await
+}
+
+async fn connect_impl(
+    cfg: &ClientConfig,
+    stats: SharedStats,
+    announce_caps: bool,
+) -> VpnResult<Connected> {
     // Forgiving input: pasted tokens routinely carry invisible whitespace,
     // and people type "ip:port" into the server field.
     let cfg = &cfg.normalized();
@@ -247,6 +293,17 @@ pub async fn connect_with_stats(cfg: &ClientConfig, stats: SharedStats) -> VpnRe
     };
     conn.send(&auth.encode_sb()).await?;
 
+    // Capability announcement right after AUTH: a 0.1.6+ server acknowledges
+    // it and both sides may batch; a 0.1.5 server ignores it (Unknown); a
+    // 0.1.4 server kicks, which trips CAPS_SUPPRESSED on reconnect.
+    if announce_caps {
+        let caps = CustomPayload {
+            channel: packets::CHANNEL_TUNNEL.into(),
+            data: tunnel::encode_caps(tunnel::CAPS_BATCH),
+        };
+        conn.send(&caps.encode_sb()).await?;
+    }
+
     let deadline = Duration::from_secs(10);
     let start = Instant::now();
     tracing::info!("login: success; play state, authenticating tunnel");
@@ -291,6 +348,8 @@ pub async fn connect_with_stats(cfg: &ClientConfig, stats: SharedStats) -> VpnRe
         info,
         stats,
         cfg: cfg.clone(),
+        announced_caps: announce_caps,
+        caps_acked: false,
     })
 }
 
@@ -315,6 +374,11 @@ impl Connected {
         mut device: DeviceHandle,
         mut shutdown: watch::Receiver<bool>,
     ) -> VpnResult<()> {
+        // Split the connection: sends go through the sender, receives come
+        // from a reader pump that owns the socket's read side and NEVER
+        // stops draining it (see conn.rs).
+        let (rd, mut conn_tx) = self.conn.into_parts();
+        let mut body_rx = spawn_reader_pump(rd).await;
         let tick_period = Duration::from_millis(50);
         let mut tick = tokio::time::interval(tick_period);
         let ping_period = Duration::from_secs(self.cfg.ping_interval_secs.max(1));
@@ -323,19 +387,21 @@ impl Connected {
         let mut pending_ping: Option<Instant> = None;
         let mut crypto = self.crypto;
         let stats = Arc::clone(&self.stats);
-        let mut held: Option<Vec<u8>> = None;
+        let mut held: Option<TimedPkt> = None;
+        let mut batch_ok = false;
 
         loop {
             // A packet held back from a full batch goes first: it has already
             // left the device queue and must not wait for new traffic.
             if let Some(first) = held.take() {
                 send_one_batch(
-                    &mut self.conn,
+                    &mut conn_tx,
                     &mut crypto,
                     &mut device,
                     &stats,
                     first,
                     &mut held,
+                    batch_ok,
                 )
                 .await?;
                 continue;
@@ -347,7 +413,7 @@ impl Connected {
                             channel: packets::CHANNEL_TUNNEL.into(),
                             data: tunnel::encode_close(0),
                         };
-                        let _ = self.conn.send(&close.encode_sb()).await;
+                        let _ = conn_tx.send(&close.encode_sb()).await;
                         device.stop_device();
                         return Ok(());
                     }
@@ -357,11 +423,19 @@ impl Connected {
                         device.stop_device();
                         return Err(VpnError::Device("device closed".into()));
                     };
-                    send_one_batch(&mut self.conn, &mut crypto, &mut device, &stats, ip_packet, &mut held)
-                        .await?;
+                    send_one_batch(
+                        &mut conn_tx,
+                        &mut crypto,
+                        &mut device,
+                        &stats,
+                        ip_packet,
+                        &mut held,
+                        batch_ok,
+                    )
+                    .await?;
                 }
                 _ = tick.tick(), if self.cfg.stealth_tick => {
-                    self.conn.send(&packets::PlayerTick { on_ground: true }.encode()).await?;
+                    conn_tx.send(&packets::PlayerTick { on_ground: true }.encode()).await?;
                 }
                 _ = ping.tick() => {
                     if let Some(sent) = pending_ping {
@@ -379,14 +453,17 @@ impl Connected {
                         channel: packets::CHANNEL_TUNNEL.into(),
                         data: tunnel::encode_ping(v),
                     };
-                    self.conn.send(&cp.encode_sb()).await?;
+                    conn_tx.send(&cp.encode_sb()).await?;
                 }
-                body = self.conn.recv() => {
-                    let body = body?;
+                body = body_rx.recv() => {
+                    let Some(body) = body else {
+                        device.stop_device();
+                        return Err(VpnError::Kick("closed by server".into()));
+                    };
                     match body[0] {
                         play_id::CB_KEEP_ALIVE => {
                             let ka = packets::PlayKeepAlive::decode(&body)?;
-                            self.conn.send(&packets::PlayKeepAlive { id: ka.id }.encode()).await?;
+                            conn_tx.send(&packets::PlayKeepAlive { id: ka.id }.encode()).await?;
                         }
                         play_id::CB_CUSTOM_PAYLOAD => {
                             let cp = CustomPayload::decode_cb(&body)?;
@@ -401,6 +478,16 @@ impl Connected {
                                         }
                                     }
                                     tunnel::TunnelMsg::DataBatch(sealed) => {
+                                        if !self.announced_caps {
+                                            // A server batching toward a
+                                            // client that never announced
+                                            // caps is mismatched: die exactly
+                                            // like a pre-0.1.6 client would.
+                                            device.stop_device();
+                                            return Err(VpnError::Kick(
+                                                "batched data without caps".into(),
+                                            ));
+                                        }
                                         for ip_packet in crypto.open_batch(&sealed)? {
                                             stats.add_down(ip_packet.len() as u64);
                                             if device.outbox.send(ip_packet).await.is_err() {
@@ -415,8 +502,22 @@ impl Connected {
                                             stats.set_rtt(rtt.as_millis() as u32);
                                         }
                                     }
+                                    tunnel::TunnelMsg::CapsAck(flags) => {
+                                        if flags & tunnel::CAPS_BATCH != 0 {
+                                            batch_ok = true;
+                                        }
+                                    }
+                                    tunnel::TunnelMsg::Caps(_) => {}
                                     tunnel::TunnelMsg::Close(_) => {
                                         device.stop_device();
+                                        self.caps_acked = batch_ok;
+                                        if self.announced_caps && !batch_ok {
+                                            CAPS_SUPPRESSED.store(true, Ordering::Relaxed);
+                                            tracing::info!(
+                                                "server closed us before acknowledging caps; \
+                                                 disabling caps for this process"
+                                            );
+                                        }
                                         return Err(VpnError::Kick("closed by server".into()));
                                     }
                                     tunnel::TunnelMsg::Unknown => {}
@@ -427,6 +528,14 @@ impl Connected {
                         play_id::CB_DISCONNECT => {
                             let dc = packets::PlayDisconnect::decode(&body)?;
                             device.stop_device();
+                            self.caps_acked = batch_ok;
+                            if self.announced_caps && !batch_ok {
+                                CAPS_SUPPRESSED.store(true, Ordering::Relaxed);
+                                tracing::info!(
+                                    "kicked before caps acknowledgment; \
+                                     disabling caps for this process"
+                                );
+                            }
                             return Err(VpnError::Kick(plain_reason(&dc.reason)));
                         }
                         id if play_id::cb_known_1_8(id) => {}

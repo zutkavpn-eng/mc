@@ -1,7 +1,7 @@
 //! Raw fd device (Android VpnService ParcelFileDescriptor, or tests).
 //! Two OS threads shuttle packets; the reader polls so shutdown is prompt.
 
-use super::DeviceHandle;
+use super::{DeviceHandle, TimedPkt};
 use std::os::fd::{FromRawFd, RawFd};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -12,7 +12,7 @@ pub fn from_raw_fd(name: &str, fd: RawFd) -> DeviceHandle {
     let rd_name = format!("{name}-rd");
     let wr_name = format!("{name}-wr");
     let dev_name = name.clone();
-    let (inbox_tx, inbox_rx) = mpsc::channel::<Vec<u8>>(512);
+    let (inbox_tx, inbox_rx) = mpsc::channel::<TimedPkt>(512);
     let (outbox_tx, mut outbox_rx) = mpsc::channel::<Vec<u8>>(512);
 
     let read_fd = unsafe { libc::dup(fd) };
@@ -63,7 +63,10 @@ pub fn from_raw_fd(name: &str, fd: RawFd) -> DeviceHandle {
                             break;
                         }
                         Ok(n) => {
-                            if inbox_tx.blocking_send(buf[..n].to_vec()).is_err() {
+                            if inbox_tx
+                                .blocking_send(TimedPkt::now(buf[..n].to_vec()))
+                                .is_err()
+                            {
                                 stop_reader.store(true, Ordering::Relaxed);
                                 break;
                             }

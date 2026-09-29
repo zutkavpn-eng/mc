@@ -26,6 +26,14 @@ pub const MSG_PING: u8 = 0x04;
 pub const MSG_PONG: u8 = 0x05;
 pub const MSG_CLOSE: u8 = 0x06;
 pub const MSG_DATA_BATCH: u8 = 0x07;
+pub const MSG_CAPS: u8 = 0x08;
+pub const MSG_CAPS_ACK: u8 = 0x09;
+
+/// Capability flags carried by MSG_CAPS / MSG_CAPS_ACK. A pre-0.1.6 peer
+/// rejects unknown tunnel messages, so a client only batches once the
+/// server has acknowledged this flag, and the server only batches a client
+/// that announced it: old clients never see a batched frame on the wire.
+pub const CAPS_BATCH: u8 = 0x01;
 
 /// Coalesced-payload limits: a batch holds at most 255 sealed packets and
 /// 32 KiB of plaintext. 32 KiB keeps the serverbound custom payload under
@@ -39,6 +47,24 @@ pub const MAX_BATCH_BYTES: usize = 32_000;
 /// chunk frames: the downlink may batch up to MAX_BATCH_BYTES (chunk-shaped),
 /// the uplink stays small so a frame-size observer sees client-like traffic.
 pub const MAX_UPLINK_BYTES: usize = 8_000;
+/// CoDel-style sojourn limit: a packet that has waited this long in a
+/// device/router queue behind a backed-up link is dropped before it is
+/// sealed. Caps loaded latency at ~this value per hop instead of letting a
+/// slow radio (5G upload) pile up seconds of standing queue, which both
+/// destroys interactive latency and collapses throughput (inflated RTT
+/// shrinks the outer TCP's effective window).
+pub const MAX_QUEUED_MS: u64 = 150;
+
+/// A/B switch for the AQM (default on). `MCVPN_AQM=off` restores the old
+/// drop-only-when-full behavior for comparison runs.
+pub fn aqm_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var("MCVPN_AQM")
+            .map(|v| !matches!(v.as_str(), "off" | "0" | "false"))
+            .unwrap_or(true)
+    })
+}
 /// zlib level for coalesced tunnel payloads. Invisible on the wire (inside
 /// the CFB8 stream): level 0 (stored) skips deflating data that is already
 /// high-entropy ciphertext, at the same framing and the same size. Genuine
@@ -72,6 +98,10 @@ pub enum TunnelMsg {
     Data(Vec<u8>),
     /// Coalesced DATA: the payload is one sealed batch (see `seal_batch`).
     DataBatch(Vec<u8>),
+    /// Capability announcement (client → server).
+    Caps(u8),
+    /// Capability acknowledgment (server → client).
+    CapsAck(u8),
     Ping(u64),
     Pong(u64),
     Close(u8),
@@ -134,6 +164,14 @@ pub fn encode_close(reason: u8) -> Vec<u8> {
     vec![MSG_CLOSE, reason]
 }
 
+pub fn encode_caps(flags: u8) -> Vec<u8> {
+    vec![MSG_CAPS, flags]
+}
+
+pub fn encode_caps_ack(flags: u8) -> Vec<u8> {
+    vec![MSG_CAPS_ACK, flags]
+}
+
 pub fn decode(msg: &[u8]) -> VpnResult<TunnelMsg> {
     let bad = || VpnError::Crypto("malformed tunnel message".into());
     let mut r = msg;
@@ -184,9 +222,11 @@ pub fn decode(msg: &[u8]) -> VpnResult<TunnelMsg> {
         MSG_PING if r.len() == 8 => TunnelMsg::Ping(u64::from_be_bytes(r.try_into().unwrap())),
         MSG_PONG if r.len() == 8 => TunnelMsg::Pong(u64::from_be_bytes(r.try_into().unwrap())),
         MSG_CLOSE if r.len() == 1 => TunnelMsg::Close(r[0]),
+        MSG_CAPS if r.len() == 1 => TunnelMsg::Caps(r[0]),
+        MSG_CAPS_ACK if r.len() == 1 => TunnelMsg::CapsAck(r[0]),
         // A known type with a malformed payload is an error; only genuinely
         // unknown types are ignored (forward compatibility).
-        MSG_PING | MSG_PONG | MSG_CLOSE => return Err(bad()),
+        MSG_PING | MSG_PONG | MSG_CLOSE | MSG_CAPS | MSG_CAPS_ACK => return Err(bad()),
         _ => TunnelMsg::Unknown,
     })
 }
@@ -484,5 +524,20 @@ mod tests {
             decode(&[0xEE, 1, 2, 3]).unwrap(),
             TunnelMsg::Unknown
         ));
+    }
+
+    #[test]
+    fn caps_roundtrip_and_malformed() {
+        assert!(matches!(
+            decode(&encode_caps(CAPS_BATCH)).unwrap(),
+            TunnelMsg::Caps(CAPS_BATCH)
+        ));
+        assert!(matches!(
+            decode(&encode_caps_ack(CAPS_BATCH)).unwrap(),
+            TunnelMsg::CapsAck(CAPS_BATCH)
+        ));
+        // Known type, malformed payload: an error, never a panic.
+        assert!(decode(&[MSG_CAPS]).is_err());
+        assert!(decode(&[MSG_CAPS_ACK, 1, 2]).is_err());
     }
 }

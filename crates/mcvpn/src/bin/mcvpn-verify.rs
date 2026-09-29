@@ -60,6 +60,46 @@ struct Args {
     /// Token to use (local mode uses its own; remote requires this).
     #[arg(long)]
     token: Option<String>,
+    /// Emulate a slow link in the tee: cap throughput at KB/s (0 = off).
+    /// Makes the outer TCP + our queues behave like a phone radio.
+    #[arg(long, default_value_t = 0)]
+    rate: u64,
+    /// Emulated link RTT in ms (0 = off): per-direction chunk delay.
+    #[arg(long, default_value_t = 0)]
+    rtt: u64,
+}
+
+/// Token-bucket pacer: emulates a slow link inside the tee so the AQM can
+/// be measured the way it behaves on a phone radio.
+struct Pacer {
+    rate_bps: f64,
+    delay: Duration,
+    next: Instant,
+}
+
+impl Pacer {
+    fn new(rate_kbps: u64, rtt_ms: u64) -> Self {
+        Self {
+            rate_bps: rate_kbps as f64 * 1024.0,
+            delay: Duration::from_millis(rtt_ms / 2),
+            next: Instant::now(),
+        }
+    }
+    async fn throttle(&mut self, n: usize) {
+        if self.delay > Duration::ZERO {
+            tokio::time::sleep(self.delay).await;
+        }
+        if self.rate_bps > 0.0 {
+            let now = Instant::now();
+            if self.next < now {
+                self.next = now;
+            }
+            self.next += Duration::from_secs_f64(n as f64 / self.rate_bps);
+            if self.next > now {
+                tokio::time::sleep(self.next - now).await;
+            }
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -89,7 +129,13 @@ fn now_us() -> u64 {
         .as_micros() as u64
 }
 
-async fn run_tee(listen_port: u16, upstream_port: u16, cap: Arc<Capture>) -> anyhow::Result<()> {
+async fn run_tee(
+    listen_port: u16,
+    upstream_port: u16,
+    cap: Arc<Capture>,
+    rate_kbps: u64,
+    rtt_ms: u64,
+) -> anyhow::Result<()> {
     let listener = TcpListener::bind(("127.0.0.1", listen_port)).await?;
     let conn_idx = AtomicU64::new(0);
     loop {
@@ -112,53 +158,75 @@ async fn run_tee(listen_port: u16, upstream_port: u16, cap: Arc<Capture>) -> any
             };
             let (mut cr, mut cw) = client_sock.into_split();
             let (mut sr, mut sw) = server_sock.into_split();
-            let mut c_recorded = 0usize;
-            let mut s_recorded = 0usize;
-            let mut c_buf = [0u8; 16384];
-            let mut s_buf = [0u8; 16384];
-            loop {
-                tokio::select! {
-                    r = cr.read(&mut c_buf) => {
-                        match r {
-                            Ok(0) | Err(_) => break,
-                            Ok(n) => {
-                                if sw.write_all(&c_buf[..n]).await.is_err() { break; }
-                                let keep = if c_recorded < CAPTURE_BYTES_PER_DIR {
-                                    let take = n.min(CAPTURE_BYTES_PER_DIR - c_recorded);
-                                    c_recorded += take;
-                                    c_buf[..take].to_vec()
-                                } else if idx == 0 {
-                                    // steady-state sample for entropy analysis
-                                    c_buf[..n.min(48)].to_vec()
-                                } else { vec![] };
-                                cap.conns.lock().unwrap()[idx].c2s.push(Chunk {
-                                    ts_us: now_us(), full_len: n,
-                                    bytes: Arc::new(keep),
-                                });
+            let mut c_pacer = Pacer::new(rate_kbps, rtt_ms);
+            let mut s_pacer = Pacer::new(rate_kbps, rtt_ms);
+            // One copy task per direction: a single select loop for both
+            // directions head-of-line-blocks — a slow write in one direction
+            // stops the reads of the other, which with bounded queues on the
+            // endpoints deadlocks the whole chain.
+            let cap_c = Arc::clone(&cap);
+            let c2s = tokio::spawn(async move {
+                let mut recorded = 0usize;
+                let mut buf = [0u8; 16384];
+                loop {
+                    match cr.read(&mut buf).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => {
+                            c_pacer.throttle(n).await;
+                            if sw.write_all(&buf[..n]).await.is_err() {
+                                break;
                             }
-                        }
-                    }
-                    r = sr.read(&mut s_buf) => {
-                        match r {
-                            Ok(0) | Err(_) => break,
-                            Ok(n) => {
-                                if cw.write_all(&s_buf[..n]).await.is_err() { break; }
-                                let keep = if s_recorded < CAPTURE_BYTES_PER_DIR {
-                                    let take = n.min(CAPTURE_BYTES_PER_DIR - s_recorded);
-                                    s_recorded += take;
-                                    s_buf[..take].to_vec()
-                                } else if idx == 0 {
-                                    s_buf[..n.min(48)].to_vec()
-                                } else { vec![] };
-                                cap.conns.lock().unwrap()[idx].s2c.push(Chunk {
-                                    ts_us: now_us(), full_len: n,
-                                    bytes: Arc::new(keep),
-                                });
-                            }
+                            let keep = if recorded < CAPTURE_BYTES_PER_DIR {
+                                let take = n.min(CAPTURE_BYTES_PER_DIR - recorded);
+                                recorded += take;
+                                buf[..take].to_vec()
+                            } else if idx == 0 {
+                                // steady-state sample for entropy analysis
+                                buf[..n.min(48)].to_vec()
+                            } else {
+                                vec![]
+                            };
+                            cap_c.conns.lock().unwrap()[idx].c2s.push(Chunk {
+                                ts_us: now_us(),
+                                full_len: n,
+                                bytes: Arc::new(keep),
+                            });
                         }
                     }
                 }
-            }
+            });
+            let cap_s = Arc::clone(&cap);
+            let s2c = tokio::spawn(async move {
+                let mut recorded = 0usize;
+                let mut buf = [0u8; 16384];
+                loop {
+                    match sr.read(&mut buf).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => {
+                            s_pacer.throttle(n).await;
+                            if cw.write_all(&buf[..n]).await.is_err() {
+                                break;
+                            }
+                            let keep = if recorded < CAPTURE_BYTES_PER_DIR {
+                                let take = n.min(CAPTURE_BYTES_PER_DIR - recorded);
+                                recorded += take;
+                                buf[..take].to_vec()
+                            } else if idx == 0 {
+                                buf[..n.min(48)].to_vec()
+                            } else {
+                                vec![]
+                            };
+                            cap_s.conns.lock().unwrap()[idx].s2c.push(Chunk {
+                                ts_us: now_us(),
+                                full_len: n,
+                                bytes: Arc::new(keep),
+                            });
+                        }
+                    }
+                }
+            });
+            let _ = c2s.await;
+            let _ = s2c.await;
         });
     }
 }
@@ -251,7 +319,8 @@ async fn forward_dns(payload: &[u8]) -> Option<Vec<u8>> {
 /// The "internet" behind the server's TUN: real DNS, local ICMP, echo rest.
 async fn run_internet(internet: DeviceHandle) {
     let mut internet = internet;
-    while let Some(pkt) = internet.inbox.recv().await {
+    while let Some(tp) = internet.inbox.recv().await {
+        let pkt = tp.pkt;
         if pkt.len() < 28 || pkt[0] >> 4 != 4 {
             continue;
         }
@@ -395,7 +464,13 @@ async fn main() -> anyhow::Result<()> {
     let mut server_switch = None;
     if remote_host.is_none() {
         // Tee on the Minecraft-facing port; real server behind it.
-        tokio::spawn(run_tee(args.port, 25566, Arc::clone(&cap)));
+        tokio::spawn(run_tee(
+            args.port,
+            25566,
+            Arc::clone(&cap),
+            args.rate,
+            args.rtt,
+        ));
         let (task, switch) = start_server(25566, &token_a).await;
         server_task = Some(task);
         server_switch = Some(switch);
@@ -472,7 +547,7 @@ async fn main() -> anyhow::Result<()> {
         r.os_side.outbox.send(pkt).await?;
         let reply = match tokio::time::timeout(Duration::from_secs(5), r.os_side.inbox.recv()).await
         {
-            Ok(Some(p)) => p,
+            Ok(Some(p)) => p.pkt,
             _ => anyhow::bail!("no DNS reply through the tunnel"),
         };
         let dns_rtt = t0.elapsed().as_millis() as u64;
@@ -507,7 +582,7 @@ async fn main() -> anyhow::Result<()> {
         r.os_side.outbox.send(pkt).await?;
         let reply = match tokio::time::timeout(Duration::from_secs(5), r.os_side.inbox.recv()).await
         {
-            Ok(Some(p)) => p,
+            Ok(Some(p)) => p.pkt,
             _ => continue,
         };
         if reply.len() > 20 && reply[20] == 0 {
@@ -522,7 +597,7 @@ async fn main() -> anyhow::Result<()> {
         if let Ok(Some(reply)) =
             tokio::time::timeout(Duration::from_secs(5), r.os_side.inbox.recv()).await
         {
-            if reply.len() > 20 && reply[20] == 0 {
+            if reply.pkt.len() > 20 && reply.pkt[20] == 0 {
                 gw_rtts.push(t1.elapsed().as_millis() as u64);
             }
         }
@@ -540,52 +615,126 @@ async fn main() -> anyhow::Result<()> {
 
     // Throughput + stability soak: all clients push 1300B packets continuously.
     let deadline = Instant::now() + Duration::from_secs(args.seconds);
+    #[derive(Default)]
+    struct SoakShared {
+        echoed: u64,
+        probe_sent_at: Option<Instant>,
+        loaded_rtts: Vec<u64>,
+        dead: bool,
+    }
     let mut tasks = Vec::new();
+    let mut drains = Vec::new();
+    let mut soak_shared = Vec::new();
     for (i, r) in runners.into_iter().enumerate() {
         let mut os_side = r.os_side;
         let stats = r.stats;
         let ip = ips[i];
+        // Ookla-style loaded latency: ICMP probes sent DURING the bulk
+        // transfer, their RTT is what a user feels as "ping jumps while
+        // something loads". Probe id is unique per client so replies can be
+        // told apart from echoed bulk traffic.
+        let probe_id: u16 = 0xB000 + (i as u16 & 0x0FFF);
+        let shared = Arc::new(std::sync::Mutex::new(SoakShared::default()));
+        let drain_shared = Arc::clone(&shared);
+        // Echoes (and probe replies) MUST be drained by a separate task that
+        // never stops: when the link is paced, the uplink channel backpressures
+        // the push loop, and a push loop that stops draining deadlocks the
+        // client's bounded downlink queue against its single select loop.
+        // DeviceHandle implements Drop (stop/cleanup): take the channel
+        // endpoints out with mem::replace, then drop the husk. The mock has
+        // no stop/cleanup, so this is purely a move-check workaround.
+        let mut inbox = std::mem::replace(
+            &mut os_side.inbox,
+            tokio::sync::mpsc::channel::<mcvpn::device::TimedPkt>(1).1,
+        );
+        let drain_deadline = deadline + Duration::from_secs(3);
+        drains.push(tokio::spawn(async move {
+            loop {
+                let remain = drain_deadline.saturating_duration_since(Instant::now());
+                if remain.is_zero() {
+                    break;
+                }
+                match tokio::time::timeout(remain, inbox.recv()).await {
+                    Ok(Some(p)) => {
+                        let pkt = p.pkt;
+                        let mut g = drain_shared.lock().unwrap();
+                        if let Some(t0) = g.probe_sent_at {
+                            if pkt.len() > 28
+                                && pkt[20] == 0
+                                && u16::from_be_bytes([pkt[24], pkt[25]]) == probe_id
+                            {
+                                g.loaded_rtts.push(t0.elapsed().as_millis() as u64);
+                                g.probe_sent_at = None;
+                            }
+                        }
+                        g.echoed += pkt.len() as u64;
+                    }
+                    Ok(None) => break,
+                    Err(_) => break,
+                }
+            }
+        }));
+        soak_shared.push(Arc::clone(&shared));
+        let outbox = std::mem::replace(
+            &mut os_side.outbox,
+            tokio::sync::mpsc::channel::<Vec<u8>>(1).0,
+        );
+        drop(os_side);
+        let push_shared = Arc::clone(&shared);
         tasks.push(tokio::spawn(async move {
             let mut sent: u64 = 0;
-            let mut echoed: u64 = 0;
             let payload = vec![0x42u8; 1280];
+            let mut last_probe = Instant::now() - Duration::from_secs(10);
             while Instant::now() < deadline {
+                if last_probe.elapsed() >= Duration::from_millis(700) {
+                    last_probe = Instant::now();
+                    let pkt = fake_ip(
+                        ip.octets(),
+                        [1, 1, 1, 1],
+                        1,
+                        &icmp_echo_request(probe_id, 1),
+                    );
+                    if outbox.send(pkt).await.is_ok() {
+                        push_shared.lock().unwrap().probe_sent_at = Some(Instant::now());
+                    }
+                }
                 for _ in 0..64 {
                     if Instant::now() >= deadline {
                         break;
                     }
                     let pkt = fake_ip(ip.octets(), [9, 9, 9, 9], 6, &payload);
-                    if os_side.outbox.send(pkt).await.is_err() {
-                        return (sent, echoed, stats, true);
+                    if outbox.send(pkt).await.is_err() {
+                        push_shared.lock().unwrap().dead = true;
+                        break;
                     }
                     sent += 1;
                 }
-                // drain echoes
-                while let Ok(p) = os_side.inbox.try_recv() {
-                    echoed += p.len() as u64;
-                }
                 tokio::task::yield_now().await;
             }
-            // drain remaining echoes for a moment
-            let drain_until = Instant::now() + Duration::from_secs(2);
-            while Instant::now() < drain_until {
-                while let Ok(p) = os_side.inbox.try_recv() {
-                    echoed += p.len() as u64;
-                }
-                tokio::time::sleep(Duration::from_millis(50)).await;
-            }
-            (sent, echoed, stats, false)
+            (sent, stats)
         }));
+    }
+    // Wait for the pushes, then the drains (they self-terminate at
+    // deadline+3s so late echoes are still counted).
+    let mut push_results = Vec::new();
+    for t in tasks.into_iter() {
+        push_results.push(t.await?);
+    }
+    for d in drains.into_iter() {
+        let _ = d.await;
     }
     let mut per_client = Vec::new();
     let mut total_sent = 0u64;
     let mut total_echoed = 0u64;
     let mut any_dead = false;
-    for (i, t) in tasks.into_iter().enumerate() {
-        let (sent, echoed, stats, dead) = t.await?;
-        any_dead |= dead;
+    for (i, (sent, stats)) in push_results.into_iter().enumerate() {
+        let g = soak_shared[i].lock().unwrap();
+        any_dead |= g.dead;
         total_sent += sent;
-        total_echoed += echoed;
+        total_echoed += g.echoed;
+        let loaded_rtts = g.loaded_rtts.clone();
+        let echoed = g.echoed;
+        drop(g);
         let snap = stats.snapshot();
         per_client.push(serde_json::json!({
             "ip": ips[i].to_string(),
@@ -595,6 +744,12 @@ async fn main() -> anyhow::Result<()> {
             "tunnel_up_bytes": snap.up_bytes,
             "tunnel_down_bytes": snap.down_bytes,
             "protocol_rtt_ms": snap.rtt_ms,
+            "loaded_rtt_max_ms": loaded_rtts.iter().copied().max().unwrap_or(0),
+            "loaded_rtt_avg_ms": if loaded_rtts.is_empty() {
+                0
+            } else {
+                loaded_rtts.iter().sum::<u64>() / loaded_rtts.len() as u64
+            },
         }));
     }
     let secs = args.seconds as f64;
@@ -604,6 +759,17 @@ async fn main() -> anyhow::Result<()> {
         "throughput: up {up_mib_s:.2} MiB/s, echoed-down {down_mib_s:.2} MiB/s across {} clients",
         args.clients
     );
+    let loaded: Vec<u64> = per_client
+        .iter()
+        .filter_map(|c| c.get("loaded_rtt_max_ms").and_then(|v| v.as_u64()))
+        .collect();
+    if !loaded.is_empty() {
+        println!(
+            "loaded latency (probe during bulk): max {} ms, avg {} ms",
+            loaded.iter().copied().max().unwrap_or(0),
+            loaded.iter().sum::<u64>() / loaded.len() as u64
+        );
+    }
     println!("clients lost mid-soak: {}", any_dead as usize);
 
     // Reconnect test: kill the server, restart, expect the client to come back.

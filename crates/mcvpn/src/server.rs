@@ -2,7 +2,8 @@
 //! and the play-state session that carries the tunnel.
 
 use crate::config::ServerConfig;
-use crate::conn::Conn;
+use crate::conn::{spawn_reader_pump, Conn, ConnSender};
+use crate::device::TimedPkt;
 use crate::error::{VpnError, VpnResult};
 use crate::ip_pool::IpPool;
 use crate::stats::{SharedStats, Stats};
@@ -20,14 +21,14 @@ use tokio::sync::{mpsc, watch, Semaphore};
 
 pub struct Router {
     /// Client tunnel IP -> per-connection deliver channel (TUN -> client).
-    by_ip: Mutex<HashMap<Ipv4Addr, mpsc::Sender<Vec<u8>>>>,
+    by_ip: Mutex<HashMap<Ipv4Addr, mpsc::Sender<TimedPkt>>>,
     /// Packets from clients -> TUN write side.
     tun_out: mpsc::Sender<Vec<u8>>,
     stats: SharedStats,
 }
 
 impl Router {
-    async fn deliver_batch(&self, batches: &mut HashMap<Ipv4Addr, Vec<Vec<u8>>>) {
+    async fn deliver_batch(&self, batches: &mut HashMap<Ipv4Addr, Vec<TimedPkt>>) {
         for (ip, pkts) in batches.drain() {
             let tx = self.by_ip.lock().unwrap().get(&ip).cloned();
             if let Some(tx) = tx {
@@ -35,9 +36,9 @@ impl Router {
                 // packet loss (which its TCP flows read as congestion) instead
                 // of ever-growing bufferbloat delay. The receiver's
                 // anti-replay window tolerates the resulting counter gaps.
-                for pkt in pkts {
-                    let len = pkt.len() as u64;
-                    if tx.try_send(pkt).is_ok() {
+                for tp in pkts {
+                    let len = tp.pkt.len() as u64;
+                    if tx.try_send(tp).is_ok() {
                         self.stats.add_up(len);
                     } else {
                         self.stats.add_drop();
@@ -48,15 +49,15 @@ impl Router {
     }
 
     #[allow(dead_code)]
-    async fn deliver(&self, ip: Ipv4Addr, pkt: Vec<u8>) {
+    async fn deliver(&self, ip: Ipv4Addr, tp: TimedPkt) {
         let tx = self.by_ip.lock().unwrap().get(&ip).cloned();
         if let Some(tx) = tx {
-            if tx.try_send(pkt).is_err() {
+            if tx.try_send(tp).is_err() {
                 self.stats.add_drop();
             }
         }
     }
-    fn register(&self, ip: Ipv4Addr, tx: mpsc::Sender<Vec<u8>>) {
+    fn register(&self, ip: Ipv4Addr, tx: mpsc::Sender<TimedPkt>) {
         self.by_ip.lock().unwrap().insert(ip, tx);
     }
     fn unregister(&self, ip: Ipv4Addr) {
@@ -133,12 +134,12 @@ pub async fn run(
             match tokio::time::timeout(remain, dev.inbox.recv()).await {
                 // Accept only OUR IPv4 ICMP echo reply; skip other traffic
                 // (IPv6/martian noise, a reconnecting client's packets).
-                Ok(Some(pkt))
-                    if pkt.len() > 28
-                        && pkt[0] >> 4 == 4
-                        && pkt[20] == 0
-                        && pkt[24] == 0x6D
-                        && pkt[25] == 0x63 =>
+                Ok(Some(tp))
+                    if tp.pkt.len() > 28
+                        && tp.pkt[0] >> 4 == 4
+                        && tp.pkt[20] == 0
+                        && tp.pkt[24] == 0x6D
+                        && tp.pkt[25] == 0x63 =>
                 {
                     ok = true;
                     break;
@@ -173,10 +174,10 @@ pub async fn run(
     }
     let router_task = tokio::spawn({
         let router = Arc::clone(&router);
-        let mut inbox = std::mem::replace(&mut dev.inbox, mpsc::channel(1).1);
+        let mut inbox = std::mem::replace(&mut dev.inbox, mpsc::channel::<TimedPkt>(1).1);
         async move {
             // Drain bursts per wake and group by destination client.
-            let mut batches: HashMap<Ipv4Addr, Vec<Vec<u8>>> = HashMap::new();
+            let mut batches: HashMap<Ipv4Addr, Vec<TimedPkt>> = HashMap::new();
             while let Some(first) = inbox.recv().await {
                 let mut batch = vec![first];
                 while batch.len() < 256 {
@@ -185,10 +186,10 @@ pub async fn run(
                         Err(_) => break,
                     }
                 }
-                for pkt in batch {
-                    if pkt.len() >= 20 && pkt[0] >> 4 == 4 {
-                        let dst = Ipv4Addr::new(pkt[16], pkt[17], pkt[18], pkt[19]);
-                        batches.entry(dst).or_default().push(pkt);
+                for tp in batch {
+                    if tp.pkt.len() >= 20 && tp.pkt[0] >> 4 == 4 {
+                        let dst = Ipv4Addr::new(tp.pkt[16], tp.pkt[17], tp.pkt[18], tp.pkt[19]);
+                        batches.entry(dst).or_default().push(tp);
                     }
                 }
                 router.deliver_batch(&mut batches).await;
@@ -665,18 +666,21 @@ impl Drop for SessionGuard<'_> {
 /// per call keeps keep-alive and uplink processing responsive while a bulk
 /// transfer runs; a packet that does not fit is stored in `held`, never dropped.
 async fn send_downlink_batch(
-    conn: &mut Conn,
+    conn: &mut ConnSender,
     crypto: &mut TunnelCrypto,
-    rx: &mut mpsc::Receiver<Vec<u8>>,
-    first: Vec<u8>,
-    held: &mut Option<Vec<u8>>,
+    rx: &mut mpsc::Receiver<TimedPkt>,
+    first: TimedPkt,
+    held: &mut Option<TimedPkt>,
+    allow_batch: bool,
 ) -> VpnResult<()> {
     let mut batch = vec![first];
-    let mut bytes = batch[0].len();
-    while batch.len() < tunnel::MAX_BATCH_PKTS {
+    let mut bytes = batch[0].pkt.len();
+    // Without the caps announcement the peer is pre-0.1.6 and dies on the
+    // first batched frame: send single-packet DATA only.
+    while allow_batch && batch.len() < tunnel::MAX_BATCH_PKTS {
         match rx.try_recv() {
-            Ok(p) if bytes + p.len() <= tunnel::MAX_BATCH_BYTES => {
-                bytes += p.len();
+            Ok(p) if bytes + p.pkt.len() <= tunnel::MAX_BATCH_BYTES => {
+                bytes += p.pkt.len();
                 batch.push(p);
             }
             Ok(p) => {
@@ -686,10 +690,24 @@ async fn send_downlink_batch(
             Err(_) => break,
         }
     }
-    let sealed = if batch.len() == 1 {
-        crypto.seal(&batch[0]).map(tunnel::encode_data)
+    // AQM: the downlink to a slow phone used to sit on up to a second of
+    // standing queue (a full 1024-packet channel at 5G rates): drop stale
+    // packets so the phone's TCP flows converge on the real radio rate.
+    let mut kept: Vec<Vec<u8>> = Vec::with_capacity(batch.len());
+    for tp in batch.drain(..) {
+        if tunnel::aqm_enabled() && tp.ts.elapsed().as_millis() as u64 > tunnel::MAX_QUEUED_MS {
+            // The session loop below counts drops via its stats handle.
+        } else {
+            kept.push(tp.pkt);
+        }
+    }
+    if kept.is_empty() {
+        return Ok(());
+    }
+    let sealed = if kept.len() == 1 {
+        crypto.seal(&kept[0]).map(tunnel::encode_data)
     } else {
-        crypto.seal_batch(&batch).map(tunnel::encode_data_batch)
+        crypto.seal_batch(&kept).map(tunnel::encode_data_batch)
     }?;
     let cp = CustomPayload {
         channel: packets::CHANNEL_TUNNEL.into(),
@@ -700,12 +718,19 @@ async fn send_downlink_batch(
 }
 
 async fn play_session(
-    mut conn: Conn,
+    conn: Conn,
     shared: &Arc<ServerShared>,
     username: String,
     secret: [u8; 16],
 ) -> VpnResult<()> {
     use mc_protocol::packets::play_id::{SB_CLIENT_SETTINGS, SB_CUSTOM_PAYLOAD, SB_KEEP_ALIVE};
+
+    // Split the connection: sends go through the sender, receives come from
+    // a reader pump that owns the read side and NEVER stops draining the
+    // socket (see conn.rs) — the loop below can block for seconds writing to
+    // a slow phone without stopping the phone's uplink.
+    let (rd, mut conn_tx) = conn.into_parts();
+    let mut body_rx = spawn_reader_pump(rd).await;
 
     let keepalive_interval = Duration::from_secs(shared.cfg.keepalive_secs);
     let mut keepalive_tick = tokio::time::interval_at(
@@ -724,9 +749,12 @@ async fn play_session(
         username: None,
     };
     let mut crypto: Option<TunnelCrypto> = None;
-    let mut to_client_rx: Option<mpsc::Receiver<Vec<u8>>> = None;
+    let mut to_client_rx: Option<mpsc::Receiver<TimedPkt>> = None;
     // A packet held back from a full downlink batch (never dropped).
-    let mut held_client: Option<Vec<u8>> = None;
+    let mut held_client: Option<TimedPkt> = None;
+    // Tunnel capabilities announced by this client (MSG_CAPS): a 0.1.6+
+    // client announces CAPS_BATCH and may be sent batched DATA frames.
+    let mut peer_caps: u8 = 0;
     let mut auth_deadline =
         Some(Instant::now() + Duration::from_secs(shared.cfg.auth_timeout_secs));
 
@@ -736,11 +764,12 @@ async fn play_session(
         if let Some(first) = held_client.take() {
             if let Some(c) = crypto.as_mut() {
                 if send_downlink_batch(
-                    &mut conn,
+                    &mut conn_tx,
                     c,
                     to_client_rx.as_mut().expect("rx exists once crypto does"),
                     first,
                     &mut held_client,
+                    peer_caps & tunnel::CAPS_BATCH != 0,
                 )
                 .await
                 .is_err()
@@ -755,17 +784,20 @@ async fn play_session(
             _ => Duration::MAX,
         };
         let body = tokio::select! {
-            b = conn.recv() => b?,
+            b = body_rx.recv() => {
+                let Some(b) = b else { break };
+                b
+            }
             _ = tokio::time::sleep(auth_wait), if crypto.is_none() => {
                 let reason = kick::not_whitelisted();
-                conn.send(&packets::PlayDisconnect { reason }.encode()).await?;
+                conn_tx.send(&packets::PlayDisconnect { reason }.encode()).await?;
                 break;
             }
             _ = keepalive_tick.tick() => {
                 if let Some((_, sent)) = pending_keepalive {
                     if sent.elapsed() > keepalive_timeout {
                         let reason = kick::timed_out();
-                        let _ = conn.send(&packets::PlayDisconnect { reason }.encode()).await;
+                        let _ = conn_tx.send(&packets::PlayDisconnect { reason }.encode()).await;
                         break;
                     }
                 }
@@ -776,7 +808,7 @@ async fn play_session(
                     .map(|d| d.as_millis() as u32)
                     .unwrap_or_else(|_| rand::rngs::OsRng.next_u32());
                 pending_keepalive = Some((id, Instant::now()));
-                conn.send(&packets::PlayKeepAlive { id }.encode()).await?;
+                conn_tx.send(&packets::PlayKeepAlive { id }.encode()).await?;
                 continue;
             }
             pkt = async {
@@ -788,11 +820,12 @@ async fn play_session(
                 let Some(pkt) = pkt else { break };
                 if let Some(c) = crypto.as_mut() {
                     if send_downlink_batch(
-                        &mut conn,
+                        &mut conn_tx,
                         c,
                         to_client_rx.as_mut().expect("rx exists once crypto does"),
                         pkt,
                         &mut held_client,
+                        peer_caps & tunnel::CAPS_BATCH != 0,
                     )
                     .await
                     .is_err()
@@ -830,14 +863,16 @@ async fn play_session(
                         tunnel::TunnelMsg::Auth { nonce, token } => {
                             if crypto.is_some() {
                                 let reason = kick::internal_error();
-                                conn.send(&packets::PlayDisconnect { reason }.encode())
+                                conn_tx
+                                    .send(&packets::PlayDisconnect { reason }.encode())
                                     .await?;
                                 break;
                             }
                             if !tunnel::token_eq(&token, shared.cfg.token.as_bytes()) {
                                 tracing::warn!(?username, "bad tunnel token, kicking");
                                 let reason = kick::not_whitelisted();
-                                conn.send(&packets::PlayDisconnect { reason }.encode())
+                                conn_tx
+                                    .send(&packets::PlayDisconnect { reason }.encode())
                                     .await?;
                                 break;
                             }
@@ -847,7 +882,8 @@ async fn play_session(
                             if prev >= shared.cfg.max_clients {
                                 shared.active_sessions.fetch_sub(1, Ordering::AcqRel);
                                 let reason = kick::server_full();
-                                conn.send(&packets::PlayDisconnect { reason }.encode())
+                                conn_tx
+                                    .send(&packets::PlayDisconnect { reason }.encode())
                                     .await?;
                                 break;
                             }
@@ -855,7 +891,8 @@ async fn play_session(
                             let ip = shared.pool.lock().unwrap().allocate();
                             let Some(ip) = ip else {
                                 let reason = kick::server_full();
-                                conn.send(&packets::PlayDisconnect { reason }.encode())
+                                conn_tx
+                                    .send(&packets::PlayDisconnect { reason }.encode())
                                     .await?;
                                 break;
                             };
@@ -888,17 +925,29 @@ async fn play_session(
                                 channel: packets::CHANNEL_TUNNEL.into(),
                                 data: tunnel::encode_auth_ok(&info),
                             };
-                            conn.send(&ok.encode_cb()).await?;
-                            let (tx, rx) = mpsc::channel(1024);
+                            conn_tx.send(&ok.encode_cb()).await?;
+                            // 256 packets (~350 KB) bounds the standing queue;
+                            // the AQM (send_downlink_batch) bounds its DELAY.
+                            let (tx, rx) = mpsc::channel::<TimedPkt>(256);
                             shared.router.register(ip, tx);
                             to_client_rx = Some(rx);
                             auth_deadline = None;
                             tracing::info!(
                                 ?username,
                                 ip = %ip,
-                                peer = ?conn.peer_addr().ok(),
+                                peer = ?conn_tx.peer_addr().ok(),
                                 "tunnel session established"
                             );
+                        }
+                        tunnel::TunnelMsg::Caps(flags) => {
+                            peer_caps |= flags & tunnel::CAPS_BATCH;
+                            // Acknowledge what we support: the client enables
+                            // uplink batching only after seeing this.
+                            let ack = CustomPayload {
+                                channel: packets::CHANNEL_TUNNEL.into(),
+                                data: tunnel::encode_caps_ack(flags & tunnel::CAPS_BATCH),
+                            };
+                            conn_tx.send(&ack.encode_cb()).await?;
                         }
                         tunnel::TunnelMsg::Data(sealed) => {
                             let Some(c) = crypto.as_mut() else { continue };
@@ -911,7 +960,8 @@ async fn play_session(
                                 Err(e) => {
                                     tracing::warn!(?username, error = %e, "bad DATA message, kicking");
                                     let reason = kick::internal_error();
-                                    conn.send(&packets::PlayDisconnect { reason }.encode())
+                                    conn_tx
+                                        .send(&packets::PlayDisconnect { reason }.encode())
                                         .await?;
                                     break;
                                 }
@@ -930,7 +980,8 @@ async fn play_session(
                                 Err(e) => {
                                     tracing::warn!(?username, error = %e, "bad DATA batch, kicking");
                                     let reason = kick::internal_error();
-                                    conn.send(&packets::PlayDisconnect { reason }.encode())
+                                    conn_tx
+                                        .send(&packets::PlayDisconnect { reason }.encode())
                                         .await?;
                                     break;
                                 }
@@ -942,7 +993,7 @@ async fn play_session(
                                     channel: packets::CHANNEL_TUNNEL.into(),
                                     data: tunnel::encode_pong(v),
                                 };
-                                conn.send(&pong.encode_cb()).await?;
+                                conn_tx.send(&pong.encode_cb()).await?;
                             }
                         }
                         tunnel::TunnelMsg::Close(_) => {
@@ -964,7 +1015,8 @@ async fn play_session(
             _ => {
                 tracing::debug!(packet = id, "unknown serverbound play packet, kicking");
                 let reason = kick::internal_error();
-                conn.send(&packets::PlayDisconnect { reason }.encode())
+                conn_tx
+                    .send(&packets::PlayDisconnect { reason }.encode())
                     .await?;
                 break;
             }

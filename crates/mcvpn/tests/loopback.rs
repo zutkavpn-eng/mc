@@ -10,7 +10,7 @@ use mcvpn::client;
 use mcvpn::config::{ClientConfig, ServerConfig};
 use mcvpn::device::mock::mock_pair;
 use mcvpn::device::DeviceHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::watch;
@@ -125,7 +125,7 @@ async fn full_loopback_bidirectional_transfer() {
         .await
         .expect("packet arrived at server TUN")
         .expect("device alive");
-    assert_eq!(got, out);
+    assert_eq!(got.pkt, out);
 
     // Internet -> server TUN -> tunnel -> client device.
     let back = fake_ip([1, 2, 3, 4], info.ip, b"reply from internet");
@@ -134,7 +134,7 @@ async fn full_loopback_bidirectional_transfer() {
         .await
         .expect("reply arrived at client device")
         .expect("device alive");
-    assert_eq!(got, back);
+    assert_eq!(got.pkt, back);
 
     // Stats reflect both directions.
     tokio::time::sleep(Duration::from_millis(300)).await;
@@ -326,6 +326,66 @@ async fn throughput_smoke() {
         mb / dt.as_secs_f32(),
         stats.snapshot().up_bytes
     );
+}
+
+/// A pre-0.1.6 client on the wire (no caps announcement) must never be sent a
+/// batched DATA frame: v0.1.4 clients died on the very first one. This is the
+/// exact regression v0.1.5 shipped: its server batched every downlink burst
+/// toward clients that could not decode it.
+#[tokio::test]
+async fn pre_caps_client_survives_downlink_bursts() {
+    let port = free_port().await;
+    let internet = spawn_server(test_server_cfg(port)).await;
+    let sess = client::connect_no_caps(&client_cfg(port, "test-token-123"))
+        .await
+        .unwrap();
+    let info = sess.info().clone();
+    let (client_dev, mut client_os_side) = mock_pair();
+    let (_tx, shutdown_rx) = watch::channel(false);
+    let task = tokio::spawn(async move { sess.attach_device(client_dev, shutdown_rx).await });
+
+    // Burst enough downlink traffic at once that a caps-blind server would
+    // coalesce it into MSG_DATA_BATCH frames.
+    let payload = vec![0x42u8; 1200];
+    for _ in 0..48 {
+        internet
+            .outbox
+            .send(fake_ip([9, 9, 9, 9], info.ip, &payload))
+            .await
+            .unwrap();
+    }
+    let mut got = 0;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while got < 48 && Instant::now() < deadline {
+        match tokio::time::timeout(Duration::from_millis(500), client_os_side.inbox.recv()).await {
+            Ok(Some(_)) => got += 1,
+            Ok(None) => panic!("client device closed after {got} of 48 packets"),
+            Err(_) => {}
+        }
+    }
+    assert_eq!(got, 48, "client must receive every burst packet");
+
+    // A second burst proves the session is still alive: a pre-0.1.6 client
+    // would have been dead before the first burst finished.
+    for _ in 0..8 {
+        internet
+            .outbox
+            .send(fake_ip([9, 9, 9, 9], info.ip, &payload))
+            .await
+            .unwrap();
+    }
+    let mut got2 = 0;
+    let deadline2 = Instant::now() + Duration::from_secs(5);
+    while got2 < 8 && Instant::now() < deadline2 {
+        match tokio::time::timeout(Duration::from_millis(500), client_os_side.inbox.recv()).await {
+            Ok(Some(_)) => got2 += 1,
+            Ok(None) => panic!("client device closed mid-second-burst"),
+            Err(_) => {}
+        }
+    }
+    assert_eq!(got2, 8, "client must survive the second burst");
+    assert!(!task.is_finished(), "session task must still be running");
+    task.abort();
 }
 
 /// The GUI's "traffic is really routed into the tunnel" check: a packet the OS

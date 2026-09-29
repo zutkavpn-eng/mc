@@ -339,7 +339,7 @@ pub fn open(info: &TunnelInfo, protect_ip: Option<Ipv4Addr>) -> VpnResult<Device
             })?,
     );
 
-    let (inbox_tx, inbox_rx) = mpsc::channel::<Vec<u8>>(512);
+    let (inbox_tx, inbox_rx) = mpsc::channel::<TimedPkt>(512);
     let (outbox_tx, mut outbox_rx) = mpsc::channel::<Vec<u8>>(512);
     let stop = Arc::new(AtomicBool::new(false));
     let stop_reader = Arc::clone(&stop);
@@ -354,7 +354,10 @@ pub fn open(info: &TunnelInfo, protect_ip: Option<Ipv4Addr>) -> VpnResult<Device
             }
             match reader_session.receive_blocking() {
                 Ok(pkt) => {
-                    if inbox_tx.blocking_send(pkt.bytes().to_vec()).is_err() {
+                    if inbox_tx
+                        .blocking_send(TimedPkt::now(pkt.bytes().to_vec()))
+                        .is_err()
+                    {
                         break;
                     }
                 }
