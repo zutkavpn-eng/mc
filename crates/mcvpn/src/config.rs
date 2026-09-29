@@ -184,9 +184,10 @@ fn clean(s: &str) -> String {
 impl ClientConfig {
     /// Forgiving input handling shared by every client (desktop GUI, CLI,
     /// Android): trims invisible junk, and accepts
-    ///   * `host`, `host:port`, `[v6]:port`
-    ///   * scheme prefixes (`mcvpn://`, `tcp://`, `http(s)://`) and a trailing `/`
-    ///   * a full share link `mcvpn://TOKEN@host:port`
+    ///   - `host`, `host:port`, `[v6]:port`
+    ///   - scheme prefixes (`mcvpn://`, `tcp://`, `http(s)://`) and a trailing `/`
+    ///   - a full share link `mcvpn://TOKEN@host:port`
+    ///
     /// A port or token found in the server string overrides the fields.
     pub fn normalized(&self) -> ClientConfig {
         let mut out = self.clone();

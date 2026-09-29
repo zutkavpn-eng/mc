@@ -34,11 +34,11 @@ fn main() -> anyhow::Result<()> {
     let args = Args::parse();
 
     if args.init {
-        let mut cfg = ServerConfig::default();
-        cfg.token = token_hex(32);
-        if let Some(p) = args.port {
-            cfg.port = p;
-        }
+        let cfg = ServerConfig {
+            token: token_hex(32),
+            port: args.port.unwrap_or(ServerConfig::default().port),
+            ..Default::default()
+        };
         if let Some(parent) = args.config.parent() {
             std::fs::create_dir_all(parent)?;
         }

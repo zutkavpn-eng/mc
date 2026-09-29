@@ -7,7 +7,7 @@ mcvpn-verify` and the scripts in `scripts/`.
 ## 1. Server install (the real one-command user flow)
 
 ```
-$ curl -fsSL https://raw.githubusercontent.com/neboysa65-lab/mc/main/scripts/install.sh | sudo bash
+$ curl -fsSL https://raw.githubusercontent.com/zutkavpn-eng/mc/main/scripts/install.sh | sudo bash
 ==> downloading mcvpn-server (x86_64)     # from the GitHub release (v0.1.1)
 ==> config
 Wrote /etc/mcvpn/server.toml — token: <random 32-byte hex>

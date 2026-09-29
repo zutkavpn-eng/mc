@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # One-command mcvpn server install (Linux x86_64/arm64 VPS).
-#   curl -fsSL https://raw.githubusercontent.com/neboysa65-lab/mc/main/scripts/install.sh | sudo bash
+#   curl -fsSL https://raw.githubusercontent.com/zutkavpn-eng/mc/main/scripts/install.sh | sudo bash
 set -euo pipefail
 
-REPO="neboysa65-lab/mc"
+REPO="zutkavpn-eng/mc"
 BASE="https://github.com/$REPO/releases/latest/download"
 BIN_DIR="/usr/local/bin"
 CONF_DIR="/etc/mcvpn"

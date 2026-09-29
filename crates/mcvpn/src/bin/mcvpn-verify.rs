@@ -614,7 +614,7 @@ async fn main() -> anyhow::Result<()> {
         let cfg = ClientConfig {
             server: "127.0.0.1".into(),
             port: args.port,
-            token: token_a.clone().into(),
+            token: token_a.clone(),
             ping_interval_secs: 1,
             stealth_tick: true,
             auto_reconnect: true,

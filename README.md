@@ -38,7 +38,7 @@ restores integrity).
 ### Server (any Linux VPS, one command)
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/neboysa65-lab/mc/main/scripts/install.sh | sudo bash
+curl -fsSL https://raw.githubusercontent.com/zutkavpn-eng/mc/main/scripts/install.sh | sudo bash
 ```
 
 Installs the binary, generates `/etc/mcvpn/server.toml` with a random token,
