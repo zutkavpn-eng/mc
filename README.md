@@ -77,6 +77,15 @@ sudo mcvpn-cli --server vpn.example.com --token <token>
 
 ## What it does well
 
+**v0.1.5 performance pass**: one encrypt/frame/write per burst of packets
+(not per packet), drop-tail queues and TCP_NOTSENT_LOWAT against bufferbloat
+("ping jumps while something loads"), zlib level 0 on tunnel payloads —
+measured **×3.9 throughput** over v0.1.4 in the same environment, symmetric
+up/down, 0 lost clients over a 16-client one-token soak.
+
+Compatibility: update the server and clients together (both v0.1.5) —
+batched tunnel frames are new.
+
 - **Byte-exact protocol**: handshake/SLP/legacy ping/login/encryption bytes are
   pinned by golden tests, including an OpenSSL-verified AES/CFB8 stream and
   Java-compatible offline UUIDs.

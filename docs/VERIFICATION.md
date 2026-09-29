@@ -132,3 +132,52 @@ has no cross-client effect.
 - Behavioral/statistical traffic analysis (volume profiling over hours)
   remains the one class of detection no protocol-exact implementation can
   fully defeat — that is an inherent limit, not a bug.
+
+---
+
+# v0.1.5 — data-plane performance pass (measured in-environment)
+
+Same machine, same harness (`mcvpn-verify`, 15 s soak, 1300 B packets),
+single connection, before/after:
+
+| | v0.1.4 | v0.1.5 | |
+|---|---|---|---|
+| Uplink, 1 client | 0.69 MiB/s | **2.70 MiB/s** | **×3.9** |
+| Echo downlink, 1 client | 0.69 MiB/s | **2.70 MiB/s** | symmetric |
+| Uplink, 16 clients (one token) | 6.67 MiB/s* | 3.84 MiB/s** | \**different, less-throttled sandbox — not comparable* |
+
+\* recorded in the v0.1.4 environment; the v0.1.5 line is this sandbox, where
+a single client already runs 2.70 MiB/s.
+
+What changed on the hot path (all inside the CFB8 stream — wire-invisible):
+
+- one GCM seal + one MC frame + one TCP write per burst (was per packet);
+  uplink batches cap at 8 KiB so serverbound frames stay client-sized,
+  downlink batches cap at 32 KiB (chunk-stream shaped)
+- zlib level 0 (stored) for coalesced tunnel payloads — level 6 deflating
+  already-random ciphertext was pure CPU loss; genuine MC-shaped packets
+  (login, keep-alive, ticks, settings) keep the Java-default level 6
+- 64 KiB reads per syscall (was 16 KiB)
+- drop-tail at full queues + TCP_NOTSENT_LOWAT (32 KiB) on Linux/Android:
+  congestion turns into packet loss the inner TCP flows react to, instead of
+  seconds of queue delay for everything behind a bulk transfer (bufferbloat
+  was the main source of "ping jumps while loading")
+- sliding anti-replay window (IPsec-style, commit-after-tag-verify) so drops
+  under load cannot desync the stream
+
+Re-verified on v0.1.5: 16 concurrent clients on one token — unique tunnel IPs,
+0 lost, 0 kicked; kill-server reconnect test passes (full state cycle,
+auto-reconnect confirmed); DNS via VPN to the real 1.1.1.1 resolves in 12 ms
+(direct 11 ms); DPI report on the v0.1.5 capture: no signature-level
+fingerprints, encrypted-phase entropy 8.000 bits/byte.
+
+Note on the 16-client soak's low *echo* number: the verify harness's
+user-space "internet" echo loop is a single task for all clients — it is the
+measuring instrument saturating, not the server data plane (the server only
+echoed what reached its TUN: down_bytes matches). A real deployment's
+downlink goes through kernel TUN + NAT with no such serialization; the
+single-client downlink (2.70 MiB/s, symmetric) exercises the same path.
+
+Compatibility: client and server must both be v0.1.5 (batched DATA frames).
+An old server kicks a new client on its first batch; a new server keeps
+accepting old (unbatched) clients.
