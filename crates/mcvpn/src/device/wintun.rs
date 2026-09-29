@@ -15,7 +15,7 @@
 //! Linux client), and removed on disconnect.
 
 use super::winroute::{choose_default_route, parse_default_routes, DefaultRoute};
-use super::DeviceHandle;
+use super::{DeviceHandle, TimedPkt};
 use crate::error::{VpnError, VpnResult};
 use crate::tunnel::TunnelInfo;
 use std::net::{IpAddr, Ipv4Addr};
