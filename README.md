@@ -86,6 +86,14 @@ up/down, 0 lost clients over a 16-client one-token soak.
 Compatibility: update the server and clients together (both v0.1.5) —
 batched tunnel frames are new.
 
+**v0.1.7 — upload-collapse and bufferbloat fix** (root-caused on a real 5G
+phone: 1.35 Mbps up, 883 ms loaded latency): sessions now never stop
+reading the socket while blocked writing it (dedicated reader/writer tasks),
+and queues drop packets that waited >150 ms instead of piling up seconds on
+a slow radio. Measured ×2.5 upload on a paced 5G-like link, loaded latency
+84–191 ms (was 883), unpaced single client ×2.3. **Update server AND
+clients to v0.1.7 together.**
+
 - **Byte-exact protocol**: handshake/SLP/legacy ping/login/encryption bytes are
   pinned by golden tests, including an OpenSSL-verified AES/CFB8 stream and
   Java-compatible offline UUIDs.

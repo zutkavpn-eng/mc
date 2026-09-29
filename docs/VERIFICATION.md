@@ -181,3 +181,45 @@ single-client downlink (2.70 MiB/s, symmetric) exercises the same path.
 Compatibility: client and server must both be v0.1.5 (batched DATA frames).
 An old server kicks a new client on its first batch; a new server keeps
 accepting old (unbatched) clients.
+
+---
+
+# v0.1.7 — the upload collapse and the 883 ms loaded latency, root-caused
+
+A real phone on 5G measured through the VPN: 6.61 Mbps down / 1.35 Mbps up,
+idle ping 59 ms, **loaded latency 249 ms down / 883 ms up**. Two real bugs
+were found by emulating the phone link (`mcvpn-verify --rate 700 --rtt 40`)
+and gdb/strace on the stalled runs:
+
+1. **Sessions read and wrote the socket in one select loop.** While the loop
+   was blocked writing to a slow peer (TCP_NOTSENT_LOWAT backpressure), it
+   stopped reading the peer entirely — two saturated endpoints then starve
+   each other through their kernel buffers, and in the worst case deadlock
+   outright (reproduced, gdb showed every task parked). The upload direction
+   collapses exactly this way during a download-heavy speedtest. Fix: the
+   connection splits into ConnReader/ConnSender — a dedicated writer task
+   owns the socket's write side, and every play-state session pumps reads
+   through its own task. TCP is full-duplex; the app now is too.
+
+2. **Deep queues bloated to seconds on a slow radio** (512/1024-packet
+   channels, drop only when full): at 5G rates that is up to a second of
+   standing queue per hop — the 883 ms. Fix: CoDel-style sojourn limit —
+   every packet carries its enqueue time and is dropped if it waited
+   >150 ms (`MCVPN_AQM=off` restores the old behavior for A/B testing);
+   the server's per-client queue went 1024 → 256 packets.
+
+Measured after the fixes, same machine, same harness:
+
+| | v0.1.5 | v0.1.7 | |
+|---|---|---|---|
+| Paced link (700 KB/s + 40 ms), up | 0.56 MiB/s* | **1.39 MiB/s** | **×2.5** |
+| Paced link, loaded latency | (883 ms on the user's phone) | **84–191 ms** | bounded by design |
+| Unpaced 1 client, up/down | 2.70 / 2.70 MiB/s | **6.35 / 6.13 MiB/s** | ×2.3 up |
+| Unpaced 16 clients (one token), up | 3.84 MiB/s* | **9.05 MiB/s** | 0 lost, 0 kicked |
+
+\* earlier environment (throttling differs run to run; the A/B pairs above
+were measured back-to-back in the same session).
+
+The remaining gap to a direct (non-tunneled) speedtest is the physics of
+IP-in-TCP-over-TCP on a lossy radio; no Minecraft-TCP transport can remove
+it. What v0.1.7 removes is everything WE added on top of that physics.
