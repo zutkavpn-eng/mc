@@ -132,11 +132,11 @@ class TunnelService : VpnService() {
             .setMtu(cfg.getInt("mtu"))
             .addAddress(cfg.getString("ip"), cfg.getInt("prefix_len"))
             .addRoute("0.0.0.0", 0)
-            // The tunnel carries IPv4 only, so pull IPv6 into it too: without
-            // this, dual-stack apps leak real IPv6 traffic outside the VPN
-            // while the UI says "connected". Uncarried traffic is dropped and
-            // apps fall back to IPv4 — a leak turned into no connectivity.
-            .addRoute("::", 0)
+            // Deliberately NO IPv6 route: per VpnService.Builder docs, a family
+            // with no address/route/DNS is blocked by the OS instantly, and an
+            // IPv4-only tunnel with a "::/0" route instead blackholes every
+            // IPv6 connection through the tunnel (apps stall until fallback).
+            // Blocked-fast is the standard single-family VPN behavior.
 
         val dns = cfg.optJSONArray("dns")
         if (dns != null) {
