@@ -173,7 +173,7 @@ async fn slp_status_ping_golden() {
         .await
         .unwrap();
 
-    let expected_json = mc_protocol::slp::status_json("A Minecraft Server", 0, 20);
+    let expected_json = mc_protocol::slp::status_json("A Minecraft Server", 0, 20, &[]);
     let expected = mc_protocol::packets::StatusResponse {
         json: expected_json,
     }

@@ -12,6 +12,10 @@ pub struct Stats {
     /// Set when the OS actually routed our route-probe datagram into the
     /// tunnel device (proves the routing table sends traffic into the VPN).
     pub probe_seen: std::sync::atomic::AtomicBool,
+    /// Tunnel packets dropped at a full per-client queue (drop-tail: loss
+    /// makes the TCP flows inside the tunnel back off instead of piling up
+    /// queue delay).
+    pub dropped: AtomicU64,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -22,6 +26,7 @@ pub struct StatsSnapshot {
     pub down_packets: u64,
     pub rtt_ms: u32,
     pub probe_seen: bool,
+    pub dropped: u64,
 }
 
 impl Stats {
@@ -33,6 +38,7 @@ impl Stats {
             down_packets: self.down_packets.load(Ordering::Relaxed),
             rtt_ms: self.rtt_ms.load(Ordering::Relaxed),
             probe_seen: self.probe_seen.load(Ordering::Relaxed),
+            dropped: self.dropped.load(Ordering::Relaxed),
         }
     }
 
@@ -48,6 +54,10 @@ impl Stats {
 
     pub fn set_rtt(&self, ms: u32) {
         self.rtt_ms.store(ms, Ordering::Relaxed);
+    }
+
+    pub fn add_drop(&self) {
+        self.dropped.fetch_add(1, Ordering::Relaxed);
     }
 }
 

@@ -24,6 +24,11 @@ pub fn encode_frame(body: &[u8], threshold: Option<u32>) -> Vec<u8> {
 /// Append the framed packet to `out` (callers coalesce several frames into
 /// one write; the byte stream is identical to separate writes).
 pub fn encode_frame_into(body: &[u8], threshold: Option<u32>, out: &mut Vec<u8>) {
+    encode_frame_into_lvl(body, threshold, 6, out);
+}
+
+/// Same, with an explicit zlib level.
+pub fn encode_frame_into_lvl(body: &[u8], threshold: Option<u32>, level: u8, out: &mut Vec<u8>) {
     let Some(th) = threshold else {
         write_varint(out, body.len() as u32);
         out.extend_from_slice(body);
@@ -35,7 +40,7 @@ pub fn encode_frame_into(body: &[u8], threshold: Option<u32>, out: &mut Vec<u8>)
         out.push(0);
         out.extend_from_slice(body);
     } else {
-        let comp = compress::deflate(body);
+        let comp = compress::deflate_level(body, level);
         let dl = varint_size(body.len() as u32);
         let frame_len = (comp.len() + dl) as u32;
         write_varint(out, frame_len);
@@ -155,7 +160,7 @@ impl FrameParser {
                     }
                     Ok(Some(payload.to_vec()))
                 } else {
-                    if (dl as u32) < th {
+                    if dl < th {
                         return Err(McError::new("claimed uncompressed size below threshold"));
                     }
                     if dl as usize > MAX_UNCOMPRESSED {

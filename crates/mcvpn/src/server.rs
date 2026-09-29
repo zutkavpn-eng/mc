@@ -16,13 +16,14 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{mpsc, watch, Semaphore};
 
 pub struct Router {
     /// Client tunnel IP -> per-connection deliver channel (TUN -> client).
     by_ip: Mutex<HashMap<Ipv4Addr, mpsc::Sender<Vec<u8>>>>,
     /// Packets from clients -> TUN write side.
     tun_out: mpsc::Sender<Vec<u8>>,
+    stats: SharedStats,
 }
 
 impl Router {
@@ -30,10 +31,17 @@ impl Router {
         for (ip, pkts) in batches.drain() {
             let tx = self.by_ip.lock().unwrap().get(&ip).cloned();
             if let Some(tx) = tx {
-                // Backpressure instead of drops; the receiving play loop
-                // drains its channel in batches, so wakes coalesce.
+                // Drop-tail at the per-client queue: a backed-up client gets
+                // packet loss (which its TCP flows read as congestion) instead
+                // of ever-growing bufferbloat delay. The receiver's
+                // anti-replay window tolerates the resulting counter gaps.
                 for pkt in pkts {
-                    let _ = tx.send(pkt).await;
+                    let len = pkt.len() as u64;
+                    if tx.try_send(pkt).is_ok() {
+                        self.stats.add_up(len);
+                    } else {
+                        self.stats.add_drop();
+                    }
                 }
             }
         }
@@ -43,8 +51,9 @@ impl Router {
     async fn deliver(&self, ip: Ipv4Addr, pkt: Vec<u8>) {
         let tx = self.by_ip.lock().unwrap().get(&ip).cloned();
         if let Some(tx) = tx {
-            // Backpressure instead of drops: a slow client throttles itself.
-            let _ = tx.send(pkt).await;
+            if tx.try_send(pkt).is_err() {
+                self.stats.add_drop();
+            }
         }
     }
     fn register(&self, ip: Ipv4Addr, tx: mpsc::Sender<Vec<u8>>) {
@@ -67,6 +76,23 @@ pub struct ServerShared {
     /// Live connection tasks (aborted together on shutdown so peers see a
     /// real disconnect instead of a half-open session).
     pub conn_tasks: Mutex<Vec<tokio::task::JoinHandle<()>>>,
+    /// Copy of the tunnel network, so the per-packet source check does not
+    /// take the pool mutex (that would serialize every session's uplink).
+    pool_base: u32,
+    pool_mask: u32,
+    pool_gateway: Ipv4Addr,
+    /// Usernames of authenticated sessions: the SLP player sample shows the
+    /// real roster, like a real server's list.
+    usernames: Mutex<Vec<String>>,
+    /// Per-boot decoy names, used only while nothing is connected and the
+    /// config fakes an online count.
+    fake_names: Vec<String>,
+}
+
+impl ServerShared {
+    fn pool_contains(&self, ip: Ipv4Addr) -> bool {
+        u32::from(ip) & self.pool_mask == self.pool_base
+    }
 }
 
 pub async fn run(
@@ -82,6 +108,7 @@ pub async fn run(
     let router = Arc::new(Router {
         by_ip: Mutex::new(HashMap::new()),
         tun_out: tun_out_tx,
+        stats: Arc::clone(&stats),
     });
 
     let mut dev = device;
@@ -171,6 +198,10 @@ pub async fn run(
 
     let rsa =
         mc_protocol::login_crypto::ServerRsaKey::generate(cfg.rsa_bits, &mut rand::rngs::OsRng)?;
+    let pool_base = pool.base_u32();
+    let pool_mask = pool.mask_u32();
+    let pool_gateway = pool.gateway();
+    let fake_names = decoy_names(cfg.fake_online);
     let shared = Arc::new(ServerShared {
         cfg,
         rsa,
@@ -181,6 +212,11 @@ pub async fn run(
         active_sessions: AtomicU32::new(0),
         per_ip: Mutex::new(HashMap::new()),
         conn_tasks: Mutex::new(Vec::new()),
+        pool_base,
+        pool_mask,
+        pool_gateway,
+        usernames: Mutex::new(Vec::new()),
+        fake_names,
     });
 
     let bind_addr: SocketAddr = format!("{}:{}", shared.cfg.bind, shared.cfg.port).parse()?;
@@ -213,6 +249,13 @@ pub async fn run(
         dev.stop_device();
     });
 
+    // Cap concurrent connections (live sessions plus in-flight handshakes): a
+    // flood of half-open connections must not spawn unbounded tasks, each with
+    // a frame parser that can hold up to 2 MiB.
+    let conn_sem = Arc::new(Semaphore::new(
+        (shared.cfg.max_clients + shared.cfg.max_pending) as usize,
+    ));
+
     loop {
         tokio::select! {
             res = shutdown.changed() => {
@@ -222,17 +265,32 @@ pub async fn run(
                 }
             }
             accepted = listener.accept() => {
-                let (stream, peer) = accepted?;
+                let (stream, peer) = match accepted {
+                    Ok(v) => v,
+                    // EMFILE/ENOBUFS under a connection flood must not take the
+                    // whole server down (systemd would restart it into a crash
+                    // loop that the flood sustains).
+                    Err(e) => {
+                        tracing::warn!(error = %e, "accept failed, continuing");
+                        tokio::time::sleep(Duration::from_millis(50)).await;
+                        continue;
+                    }
+                };
                 if !throttle_ok(&shared, peer.ip()) {
                     drop(stream);
                     continue;
                 }
-                if shared.pending.load(Ordering::Relaxed) >= shared.cfg.max_pending {
-                    drop(stream);
-                    continue;
-                }
+                let permit = match Arc::clone(&conn_sem).try_acquire_owned() {
+                    Ok(p) => p,
+                    Err(_) => {
+                        tracing::debug!(%peer, "connection cap reached, dropping");
+                        drop(stream);
+                        continue;
+                    }
+                };
                 let conn_shared = Arc::clone(&shared);
                 let task = tokio::spawn(async move {
+                    let _permit = permit;
                     if let Err(e) = handle_conn(stream, conn_shared).await {
                         tracing::debug!("connection ended: {e}");
                     }
@@ -279,11 +337,78 @@ fn throttle_ok(shared: &ServerShared, ip: IpAddr) -> bool {
     }
 }
 
+/// SLP player sample: the live roster when clients are connected, otherwise
+/// per-boot decoys (only if the config fakes an online count).
+fn sample_names(shared: &ServerShared) -> Vec<String> {
+    let live = shared.usernames.lock().unwrap().clone();
+    if !live.is_empty() {
+        return live;
+    }
+    if shared.cfg.fake_online == 0 {
+        return Vec::new();
+    }
+    shared.fake_names.clone()
+}
+
+/// Decoy player names for the fake online count. Distinct every boot: a fixed
+/// list would be identical on every deployment (a cross-server fingerprint).
+fn decoy_names(n: u32) -> Vec<String> {
+    const FIRST: [&str; 10] = [
+        "Silent", "Swift", "Crimson", "Frost", "Nova", "Ember", "Onyx", "Lunar", "Rusty", "Pixel",
+    ];
+    const SECOND: [&str; 10] = [
+        "Fox", "Wolf", "Crow", "Lynx", "Bear", "Hawk", "Moth", "Otter", "Raven", "Koala",
+    ];
+    let mut rng = rand::rngs::OsRng;
+    (0..n.min(12) as usize)
+        .map(|_| {
+            let a = FIRST[(rng.next_u32() % FIRST.len() as u32) as usize];
+            let b = SECOND[(rng.next_u32() % SECOND.len() as u32) as usize];
+            format!("{a}{b}{:02}", rng.next_u32() % 100)
+        })
+        .collect()
+}
+
 fn online_count(shared: &ServerShared) -> u32 {
-    shared
+    let raw = shared
         .active_sessions
         .load(Ordering::Relaxed)
         .max(shared.cfg.fake_online)
+    // A real server never shows more players than its max slots (a scanner
+    // probing a loaded VPN would otherwise flag "online > max").
+    ;
+    raw.min(shared.cfg.max_players)
+}
+
+/// Forward one authenticated client IP packet toward the TUN (internet side).
+/// Returns false only when the data plane is shutting down.
+fn route_client_packet(shared: &Arc<ServerShared>, ip_packet: Vec<u8>) -> bool {
+    if ip_packet.len() < 20 || ip_packet[0] >> 4 != 4 {
+        return true;
+    }
+    let src = Ipv4Addr::new(ip_packet[12], ip_packet[13], ip_packet[14], ip_packet[15]);
+    if !shared.pool_contains(src) {
+        return true;
+    }
+    // Client isolation: one client must not reach another client's tunnel
+    // address through the server (the gateway stays reachable).
+    let dst = Ipv4Addr::new(ip_packet[16], ip_packet[17], ip_packet[18], ip_packet[19]);
+    if shared.pool_contains(dst) && dst != shared.pool_gateway {
+        shared.stats.add_drop();
+        return true;
+    }
+    shared.stats.add_down(ip_packet.len() as u64);
+    // A full queue is momentary congestion, not a dead data plane: drop this
+    // packet (loss, not latency) and keep the session alive. Only a closed
+    // queue ends it.
+    match shared.router.tun_out.try_send(ip_packet) {
+        Ok(()) => true,
+        Err(mpsc::error::TrySendError::Full(_)) => {
+            shared.stats.add_drop();
+            true
+        }
+        Err(mpsc::error::TrySendError::Closed(_)) => false,
+    }
 }
 
 async fn handle_conn(stream: TcpStream, shared: Arc<ServerShared>) -> VpnResult<()> {
@@ -306,7 +431,13 @@ async fn handle_conn(stream: TcpStream, shared: Arc<ServerShared>) -> VpnResult<
         let probe = match probe {
             mc_protocol::legacy::LegacyProbe::Ping(_) => {
                 let mut second = [0u8; 1];
-                let has_second = conn.read_raw_exact(&mut second).await.unwrap_or(0);
+                // Bounded: a peer that sends the first 0xFE byte and then
+                // stalls must not park a task forever.
+                let has_second =
+                    tokio::time::timeout(Duration::from_secs(5), conn.read_raw_exact(&mut second))
+                        .await
+                        .unwrap_or(Ok(0))
+                        .unwrap_or(0);
                 let second = if has_second == 1 {
                     Some(second[0])
                 } else {
@@ -376,6 +507,7 @@ async fn status_flow(mut conn: Conn, shared: &Arc<ServerShared>) -> VpnResult<()
             &shared.cfg.motd,
             online_count(shared),
             shared.cfg.max_players,
+            &sample_names(shared),
         );
         let resp = packets::StatusResponse { json }.encode();
         conn.send(&resp).await?;
@@ -479,7 +611,9 @@ async fn login_flow(
     .await?;
 
     // --- Play state ---
-    let entity_id: i32 = rand::rngs::OsRng.next_u32() as i32;
+    // Vanilla hands out small positive entity ids in join order; a random full
+    // i32 (negative half the time) is a client-visible tell.
+    let entity_id: i32 = 1 + (rand::rngs::OsRng.next_u32() % 1_000_000) as i32;
     let join = packets::JoinGame {
         entity_id,
         ..Default::default()
@@ -508,6 +642,8 @@ struct SessionGuard<'a> {
     ip: Option<Ipv4Addr>,
     /// A `max_clients` slot is held (released on drop).
     counted: bool,
+    /// Username advertised in the SLP player sample while this session lives.
+    username: Option<String>,
 }
 impl Drop for SessionGuard<'_> {
     fn drop(&mut self) {
@@ -518,7 +654,49 @@ impl Drop for SessionGuard<'_> {
         if self.counted {
             self.shared.active_sessions.fetch_sub(1, Ordering::AcqRel);
         }
+        if let Some(u) = &self.username {
+            self.shared.usernames.lock().unwrap().retain(|n| n != u);
+        }
     }
+}
+
+/// Coalesce queued TUN packets into a single MW|Tunnel payload for one client:
+/// one frame/compress/encrypt pass per burst (invisible inside CFB8). One batch
+/// per call keeps keep-alive and uplink processing responsive while a bulk
+/// transfer runs; a packet that does not fit is stored in `held`, never dropped.
+async fn send_downlink_batch(
+    conn: &mut Conn,
+    crypto: &mut TunnelCrypto,
+    rx: &mut mpsc::Receiver<Vec<u8>>,
+    first: Vec<u8>,
+    held: &mut Option<Vec<u8>>,
+) -> VpnResult<()> {
+    let mut batch = vec![first];
+    let mut bytes = batch[0].len();
+    while batch.len() < tunnel::MAX_BATCH_PKTS {
+        match rx.try_recv() {
+            Ok(p) if bytes + p.len() <= tunnel::MAX_BATCH_BYTES => {
+                bytes += p.len();
+                batch.push(p);
+            }
+            Ok(p) => {
+                *held = Some(p);
+                break;
+            }
+            Err(_) => break,
+        }
+    }
+    let sealed = if batch.len() == 1 {
+        crypto.seal(&batch[0]).map(tunnel::encode_data)
+    } else {
+        crypto.seal_batch(&batch).map(tunnel::encode_data_batch)
+    }?;
+    let cp = CustomPayload {
+        channel: packets::CHANNEL_TUNNEL.into(),
+        data: sealed,
+    };
+    conn.send_lvl(&cp.encode_cb(), tunnel::BATCH_DEFLATE_LEVEL)
+        .await
 }
 
 async fn play_session(
@@ -534,20 +712,44 @@ async fn play_session(
         tokio::time::Instant::now() + keepalive_interval,
         keepalive_interval,
     );
-    let keepalive_timeout = keepalive_interval.saturating_mul(3);
+    // Vanilla 1.8.9 kicks a client that stops answering within 30 s; the
+    // default 15 s cadence means two missed keep-alives.
+    let keepalive_timeout = keepalive_interval.saturating_mul(2);
     let mut pending_keepalive: Option<(u32, Instant)> = None;
 
     let mut session = SessionGuard {
         shared,
         ip: None,
         counted: false,
+        username: None,
     };
     let mut crypto: Option<TunnelCrypto> = None;
     let mut to_client_rx: Option<mpsc::Receiver<Vec<u8>>> = None;
+    // A packet held back from a full downlink batch (never dropped).
+    let mut held_client: Option<Vec<u8>> = None;
     let mut auth_deadline =
         Some(Instant::now() + Duration::from_secs(shared.cfg.auth_timeout_secs));
 
     loop {
+        // A held-back packet goes first: it has already left the router queue
+        // and must not wait for new traffic.
+        if let Some(first) = held_client.take() {
+            if let Some(c) = crypto.as_mut() {
+                if send_downlink_batch(
+                    &mut conn,
+                    c,
+                    to_client_rx.as_mut().expect("rx exists once crypto does"),
+                    first,
+                    &mut held_client,
+                )
+                .await
+                .is_err()
+                {
+                    break;
+                }
+            }
+            continue;
+        }
         let auth_wait = match (auth_deadline, crypto.is_none()) {
             (Some(d), true) => d.saturating_duration_since(Instant::now()),
             _ => Duration::MAX,
@@ -567,7 +769,12 @@ async fn play_session(
                         break;
                     }
                 }
-                let id: u32 = rand::rngs::OsRng.next_u32() % 2_000_000;
+                // Vanilla derives the id from the system clock; a small random
+                // number is something no 1.8.9 server ever sends.
+                let id: u32 = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis() as u32)
+                    .unwrap_or_else(|_| rand::rngs::OsRng.next_u32());
                 pending_keepalive = Some((id, Instant::now()));
                 conn.send(&packets::PlayKeepAlive { id }.encode()).await?;
                 continue;
@@ -580,34 +787,16 @@ async fn play_session(
             } => {
                 let Some(pkt) = pkt else { break };
                 if let Some(c) = crypto.as_mut() {
-                    // Drain queued TUN packets for this client and coalesce.
-                    let mut batch = vec![pkt];
-                    while batch.len() < 128 {
-                        match to_client_rx.as_mut().unwrap().try_recv() {
-                            Ok(p) => batch.push(p),
-                            Err(_) => break,
-                        }
-                    }
-                    let mut frames = Vec::with_capacity(batch.len());
-                    let mut failed = false;
-                    for pkt in batch {
-                        match c.seal(&pkt) {
-                            Ok(sealed) => {
-                                frames.push(
-                                    CustomPayload {
-                                        channel: packets::CHANNEL_TUNNEL.into(),
-                                        data: tunnel::encode_data(sealed),
-                                    }
-                                    .encode_cb(),
-                                );
-                            }
-                            Err(_) => {
-                                failed = true;
-                                break;
-                            }
-                        }
-                    }
-                    if failed || conn.send_batch(frames).await.is_err() {
+                    if send_downlink_batch(
+                        &mut conn,
+                        c,
+                        to_client_rx.as_mut().expect("rx exists once crypto does"),
+                        pkt,
+                        &mut held_client,
+                    )
+                    .await
+                    .is_err()
+                    {
                         break;
                     }
                 }
@@ -673,6 +862,10 @@ async fn play_session(
                             // The guard owns the address from here on, so a failed
                             // send below can no longer leak it from the pool.
                             session.ip = Some(ip);
+                            // The SLP sample lists real players, like a real
+                            // server's roster.
+                            shared.usernames.lock().unwrap().push(username.clone());
+                            session.username = Some(username.clone());
                             crypto = Some(TunnelCrypto::derive(&secret, &nonce, Role::Server)?);
                             let (netmask, gateway) = {
                                 let pool = shared.pool.lock().unwrap();
@@ -711,24 +904,31 @@ async fn play_session(
                             let Some(c) = crypto.as_mut() else { continue };
                             match c.open(&sealed) {
                                 Ok(ip_packet) => {
-                                    if ip_packet.len() >= 20 && ip_packet[0] >> 4 == 4 {
-                                        let src = Ipv4Addr::new(
-                                            ip_packet[12],
-                                            ip_packet[13],
-                                            ip_packet[14],
-                                            ip_packet[15],
-                                        );
-                                        if shared.pool.lock().unwrap().contains(src) {
-                                            shared.stats.add_down(ip_packet.len() as u64);
-                                            if shared.router.tun_out.send(ip_packet).await.is_err()
-                                            {
-                                                break;
-                                            }
-                                        }
+                                    if !route_client_packet(shared, ip_packet) {
+                                        break;
                                     }
                                 }
                                 Err(e) => {
                                     tracing::warn!(?username, error = %e, "bad DATA message, kicking");
+                                    let reason = kick::internal_error();
+                                    conn.send(&packets::PlayDisconnect { reason }.encode())
+                                        .await?;
+                                    break;
+                                }
+                            }
+                        }
+                        tunnel::TunnelMsg::DataBatch(sealed) => {
+                            let Some(c) = crypto.as_mut() else { continue };
+                            match c.open_batch(&sealed) {
+                                Ok(pkts) => {
+                                    for ip_packet in pkts {
+                                        if !route_client_packet(shared, ip_packet) {
+                                            return Ok(());
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    tracing::warn!(?username, error = %e, "bad DATA batch, kicking");
                                     let reason = kick::internal_error();
                                     conn.send(&packets::PlayDisconnect { reason }.encode())
                                         .await?;
@@ -749,6 +949,7 @@ async fn play_session(
                             tracing::info!(?username, "tunnel closed by client");
                             break;
                         }
+                        tunnel::TunnelMsg::Unknown => {}
                         _ => {}
                     },
                     other => {

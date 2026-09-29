@@ -47,6 +47,59 @@ async fn recv_timeout(conn: &mut Conn, d: Duration) -> VpnResult<Vec<u8>> {
         .map_err(|_| VpnError::Timeout)?
 }
 
+/// Coalesce one burst of device packets into a single MW|Tunnel payload: one
+/// frame/compress/encrypt pass per burst instead of one per packet. The payload
+/// lives inside the CFB8 stream, so this is invisible on the wire.
+///
+/// A packet that does not fit the batch is stored in `held` and sent by the
+/// next call — the old `try_recv` drain dropped it, costing one IP packet per
+/// batch boundary (retransmits inside the tunnel). Building one batch per call,
+/// rather than draining the whole queue, keeps keep-alive, ping and server
+/// packets responsive while a bulk transfer is running.
+async fn send_one_batch(
+    conn: &mut Conn,
+    crypto: &mut TunnelCrypto,
+    device: &mut DeviceHandle,
+    stats: &Stats,
+    first: Vec<u8>,
+    held: &mut Option<Vec<u8>>,
+) -> VpnResult<()> {
+    let mut batch = vec![first];
+    let mut bytes = batch[0].len();
+    while batch.len() < tunnel::MAX_BATCH_PKTS {
+        match device.inbox.try_recv() {
+            Ok(p) if bytes + p.len() <= tunnel::MAX_UPLINK_BYTES => {
+                bytes += p.len();
+                batch.push(p);
+            }
+            Ok(p) => {
+                *held = Some(p);
+                break;
+            }
+            Err(_) => break,
+        }
+    }
+    for ip_packet in &batch {
+        if ip_packet.len() >= 20 && ip_packet[16..20] == PROBE_ADDR {
+            stats
+                .probe_seen
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        stats.add_up(ip_packet.len() as u64);
+    }
+    let sealed = if batch.len() == 1 {
+        crypto.seal(&batch[0]).map(tunnel::encode_data)
+    } else {
+        crypto.seal_batch(&batch).map(tunnel::encode_data_batch)
+    }?;
+    let cp = CustomPayload {
+        channel: packets::CHANNEL_TUNNEL.into(),
+        data: sealed,
+    };
+    conn.send_lvl(&cp.encode_sb(), tunnel::BATCH_DEFLATE_LEVEL)
+        .await
+}
+
 /// Flatten a JSON chat component reason for display.
 pub fn plain_reason(json: &str) -> String {
     let mut s = json.to_string();
@@ -270,8 +323,23 @@ impl Connected {
         let mut pending_ping: Option<Instant> = None;
         let mut crypto = self.crypto;
         let stats = Arc::clone(&self.stats);
+        let mut held: Option<Vec<u8>> = None;
 
         loop {
+            // A packet held back from a full batch goes first: it has already
+            // left the device queue and must not wait for new traffic.
+            if let Some(first) = held.take() {
+                send_one_batch(
+                    &mut self.conn,
+                    &mut crypto,
+                    &mut device,
+                    &stats,
+                    first,
+                    &mut held,
+                )
+                .await?;
+                continue;
+            }
             tokio::select! {
                 res = shutdown.changed() => {
                     if res.is_err() || *shutdown.borrow() {
@@ -289,32 +357,8 @@ impl Connected {
                         device.stop_device();
                         return Err(VpnError::Device("device closed".into()));
                     };
-                    // Drain up to 64 queued packets and coalesce into one write.
-                    let mut batch = vec![ip_packet];
-                    while batch.len() < 128 {
-                        match device.inbox.try_recv() {
-                            Ok(p) => batch.push(p),
-                            Err(_) => break,
-                        }
-                    }
-                    let mut frames = Vec::with_capacity(batch.len());
-                    for ip_packet in batch {
-                        if ip_packet.len() >= 20 && ip_packet[16..20] == PROBE_ADDR {
-                            stats
-                                .probe_seen
-                                .store(true, std::sync::atomic::Ordering::Relaxed);
-                        }
-                        stats.add_up(ip_packet.len() as u64);
-                        let sealed = crypto.seal(&ip_packet)?;
-                        frames.push(
-                            CustomPayload {
-                                channel: packets::CHANNEL_TUNNEL.into(),
-                                data: tunnel::encode_data(sealed),
-                            }
-                            .encode_sb(),
-                        );
-                    }
-                    self.conn.send_batch(frames).await?;
+                    send_one_batch(&mut self.conn, &mut crypto, &mut device, &stats, ip_packet, &mut held)
+                        .await?;
                 }
                 _ = tick.tick(), if self.cfg.stealth_tick => {
                     self.conn.send(&packets::PlayerTick { on_ground: true }.encode()).await?;
@@ -356,6 +400,15 @@ impl Connected {
                                             return Err(VpnError::Device("device closed".into()));
                                         }
                                     }
+                                    tunnel::TunnelMsg::DataBatch(sealed) => {
+                                        for ip_packet in crypto.open_batch(&sealed)? {
+                                            stats.add_down(ip_packet.len() as u64);
+                                            if device.outbox.send(ip_packet).await.is_err() {
+                                                device.stop_device();
+                                                return Err(VpnError::Device("device closed".into()));
+                                            }
+                                        }
+                                    }
                                     tunnel::TunnelMsg::Pong(_) => {
                                         if let Some(sent) = pending_ping.take() {
                                             let rtt = sent.elapsed();
@@ -366,6 +419,7 @@ impl Connected {
                                         device.stop_device();
                                         return Err(VpnError::Kick("closed by server".into()));
                                     }
+                                    tunnel::TunnelMsg::Unknown => {}
                                     _ => {}
                                 }
                             }

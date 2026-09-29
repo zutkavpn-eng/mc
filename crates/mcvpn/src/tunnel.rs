@@ -25,6 +25,31 @@ pub const MSG_DATA: u8 = 0x03;
 pub const MSG_PING: u8 = 0x04;
 pub const MSG_PONG: u8 = 0x05;
 pub const MSG_CLOSE: u8 = 0x06;
+pub const MSG_DATA_BATCH: u8 = 0x07;
+
+/// Coalesced-payload limits: a batch holds at most 255 sealed packets and
+/// 32 KiB of plaintext. 32 KiB keeps the serverbound custom payload under
+/// vanilla's hard 32767-byte plugin-message limit — a bigger batch would be
+/// kicked as "Payload may not be larger than 32767 bytes" by our own decoder
+/// (and by any vanilla-shaped one) — and it also bounds the zlib pass.
+pub const MAX_BATCH_PKTS: usize = 255;
+pub const MAX_BATCH_BYTES: usize = 32_000;
+/// Client→server batch cap. A real 1.8.9 client almost never sends large
+/// serverbound frames, while a server legitimately streams big clientbound
+/// chunk frames: the downlink may batch up to MAX_BATCH_BYTES (chunk-shaped),
+/// the uplink stays small so a frame-size observer sees client-like traffic.
+pub const MAX_UPLINK_BYTES: usize = 8_000;
+/// zlib level for coalesced tunnel payloads. Invisible on the wire (inside
+/// the CFB8 stream): level 0 (stored) skips deflating data that is already
+/// high-entropy ciphertext, at the same framing and the same size. Genuine
+/// Minecraft-shaped packets keep the Java-default level 6.
+pub const BATCH_DEFLATE_LEVEL: u8 = 0;
+
+/// Anti-replay window: how many counters ahead of the acknowledged base the
+/// receiver tolerates. Needed because the router now drops under load (rather
+/// than buffering without bound), and a dropped packet must not desync the
+/// strict counter — IPsec-style sliding window, replays still rejected.
+const RECV_WINDOW: u128 = 128;
 
 const HKDF_INFO: &[u8] = b"mcvpn/tunnel/v1";
 
@@ -39,12 +64,20 @@ pub struct TunnelInfo {
 
 #[derive(Debug)]
 pub enum TunnelMsg {
-    Auth { nonce: [u8; 16], token: Vec<u8> },
+    Auth {
+        nonce: [u8; 16],
+        token: Vec<u8>,
+    },
     AuthOk(TunnelInfo),
     Data(Vec<u8>),
+    /// Coalesced DATA: the payload is one sealed batch (see `seal_batch`).
+    DataBatch(Vec<u8>),
     Ping(u64),
     Pong(u64),
     Close(u8),
+    /// A message type this version does not know: ignored, like a real
+    /// server ignoring unknown plugin-channel payloads (forward compat).
+    Unknown,
 }
 
 pub fn encode_auth(nonce: &[u8; 16], token: &[u8]) -> Vec<u8> {
@@ -78,6 +111,13 @@ pub fn encode_data(sealed: Vec<u8>) -> Vec<u8> {
     m
 }
 
+pub fn encode_data_batch(sealed: Vec<u8>) -> Vec<u8> {
+    let mut m = Vec::with_capacity(1 + sealed.len());
+    m.push(MSG_DATA_BATCH);
+    m.extend_from_slice(&sealed);
+    m
+}
+
 pub fn encode_ping(v: u64) -> Vec<u8> {
     let mut m = vec![MSG_PING];
     m.extend_from_slice(&v.to_be_bytes());
@@ -101,7 +141,10 @@ pub fn decode(msg: &[u8]) -> VpnResult<TunnelMsg> {
     r = &r[1..];
     Ok(match t {
         MSG_AUTH => {
-            if r.len() < 3 || r[0] != VER {
+            // 1 version + 16 nonce + 2 length + token; a short payload from any
+            // peer (this runs server-side on client input) must be an error,
+            // never a slice panic.
+            if r.len() < 19 || r[0] != VER {
                 return Err(bad());
             }
             let nonce: [u8; 16] = r[1..17].try_into().map_err(|_| bad())?;
@@ -125,7 +168,7 @@ pub fn decode(msg: &[u8]) -> VpnResult<TunnelMsg> {
             let mtu = u16::from_be_bytes([r[12], r[13]]);
             let n = r[14] as usize;
             let rest = &r[15..];
-            if rest.len() != n * 4 || n > 8 || mtu < 576 || mtu > 32000 {
+            if rest.len() != n * 4 || n > 8 || !(576..=32000).contains(&mtu) {
                 return Err(bad());
             }
             TunnelMsg::AuthOk(TunnelInfo {
@@ -133,17 +176,18 @@ pub fn decode(msg: &[u8]) -> VpnResult<TunnelMsg> {
                 netmask,
                 gateway,
                 mtu,
-                dns: rest
-                    .chunks_exact(4)
-                    .map(|c| c.try_into().unwrap())
-                    .collect(),
+                dns: rest.as_chunks::<4>().0.to_vec(),
             })
         }
         MSG_DATA => TunnelMsg::Data(r.to_vec()),
+        MSG_DATA_BATCH => TunnelMsg::DataBatch(r.to_vec()),
         MSG_PING if r.len() == 8 => TunnelMsg::Ping(u64::from_be_bytes(r.try_into().unwrap())),
         MSG_PONG if r.len() == 8 => TunnelMsg::Pong(u64::from_be_bytes(r.try_into().unwrap())),
         MSG_CLOSE if r.len() == 1 => TunnelMsg::Close(r[0]),
-        _ => return Err(bad()),
+        // A known type with a malformed payload is an error; only genuinely
+        // unknown types are ignored (forward compatibility).
+        MSG_PING | MSG_PONG | MSG_CLOSE => return Err(bad()),
+        _ => TunnelMsg::Unknown,
     })
 }
 
@@ -158,7 +202,8 @@ pub struct TunnelCrypto {
     send: Aes256Gcm,
     recv: Aes256Gcm,
     send_ctr: u128,
-    recv_ctr: u128,
+    recv_base: u128,
+    recv_window: u128,
 }
 
 impl TunnelCrypto {
@@ -176,7 +221,8 @@ impl TunnelCrypto {
             send: Aes256Gcm::new_from_slice(send).expect("32 byte key"),
             recv: Aes256Gcm::new_from_slice(recv).expect("32 byte key"),
             send_ctr: 0,
-            recv_ctr: 0,
+            recv_base: 0,
+            recv_window: 0,
         })
     }
 
@@ -184,8 +230,7 @@ impl TunnelCrypto {
         GenericArray::clone_from_slice(&ctr.to_be_bytes()[4..])
     }
 
-    /// Seal an IP packet: 12-byte counter nonce + ciphertext+tag.
-    pub fn seal(&mut self, ip_packet: &[u8]) -> VpnResult<Vec<u8>> {
+    fn seal_inner(&mut self, plaintext: &[u8]) -> VpnResult<Vec<u8>> {
         if self.send_ctr == u128::MAX {
             return Err(VpnError::Crypto("nonce space exhausted".into()));
         }
@@ -194,7 +239,7 @@ impl TunnelCrypto {
         let n = Self::nonce(ctr);
         let ct = self
             .send
-            .encrypt(&n, ip_packet)
+            .encrypt(&n, plaintext)
             .map_err(|_| VpnError::Crypto("aes-gcm seal failed".into()))?;
         let mut out = Vec::with_capacity(12 + ct.len());
         out.extend_from_slice(&n);
@@ -202,9 +247,70 @@ impl TunnelCrypto {
         Ok(out)
     }
 
+    /// Seal an IP packet: 12-byte counter nonce + ciphertext+tag.
+    pub fn seal(&mut self, ip_packet: &[u8]) -> VpnResult<Vec<u8>> {
+        self.seal_inner(ip_packet)
+    }
+
+    /// Seal a coalesced batch: ONE GCM message over
+    /// `[count][len u16][packet]...`, one counter step for the whole batch.
+    pub fn seal_batch(&mut self, pkts: &[Vec<u8>]) -> VpnResult<Vec<u8>> {
+        if pkts.is_empty() || pkts.len() > MAX_BATCH_PKTS {
+            return Err(VpnError::Crypto("invalid batch size".into()));
+        }
+        let plain_len = pkts.iter().map(|p| p.len()).sum::<usize>();
+        let mut inner = Vec::with_capacity(1 + pkts.len() * 2 + plain_len);
+        inner.push(pkts.len() as u8);
+        for p in pkts {
+            let len = u16::try_from(p.len())
+                .map_err(|_| VpnError::Crypto("packet too large for batch".into()))?;
+            inner.extend_from_slice(&len.to_be_bytes());
+            inner.extend_from_slice(p);
+        }
+        self.seal_inner(&inner)
+    }
+
     /// Open a sealed DATA blob. Counters must arrive in strict order
-    /// (anti-replay); duplicates or gaps are rejected.
+    /// (anti-replay); duplicates are rejected, gaps within the window are
+    /// tolerated (upstream drops), far-ahead counters jump the window.
     pub fn open(&mut self, blob: &[u8]) -> VpnResult<Vec<u8>> {
+        self.open_inner(blob)
+    }
+
+    /// Open a sealed batch produced by `seal_batch`.
+    pub fn open_batch(&mut self, blob: &[u8]) -> VpnResult<Vec<Vec<u8>>> {
+        let inner = self.open_inner(blob)?;
+        let bad = || VpnError::Crypto("malformed batch payload".into());
+        if inner.is_empty() {
+            return Err(bad());
+        }
+        let count = inner[0] as usize;
+        let mut r = &inner[1..];
+        let mut out = Vec::with_capacity(count);
+        let mut total = 0usize;
+        for _ in 0..count {
+            if r.len() < 2 {
+                return Err(bad());
+            }
+            let len = u16::from_be_bytes([r[0], r[1]]) as usize;
+            r = &r[2..];
+            if r.len() < len {
+                return Err(bad());
+            }
+            total += len;
+            if total > MAX_BATCH_BYTES {
+                return Err(bad());
+            }
+            out.push(r[..len].to_vec());
+            r = &r[len..];
+        }
+        if !r.is_empty() {
+            return Err(bad());
+        }
+        Ok(out)
+    }
+
+    fn open_inner(&mut self, blob: &[u8]) -> VpnResult<Vec<u8>> {
         if blob.len() < 12 + 16 {
             return Err(VpnError::Crypto("sealed blob too short".into()));
         }
@@ -214,17 +320,36 @@ impl TunnelCrypto {
             b[4..].copy_from_slice(n);
             u128::from_be_bytes(b)
         };
-        if ctr < self.recv_ctr {
+        if ctr < self.recv_base {
             return Err(VpnError::Crypto("replayed or reordered counter".into()));
         }
-        if ctr > self.recv_ctr {
-            return Err(VpnError::Crypto("counter gap (dropped packets?)".into()));
-        }
+        let offset = ctr - self.recv_base;
+        // Compute the next window state, but commit it only after the tag
+        // verifies: an unauthenticated blob with a far-ahead counter must not
+        // be able to retire the counters below it (the IPsec rule).
+        let (next_base, next_window) = if offset >= RECV_WINDOW {
+            // Far ahead of the window: everything before it was dropped
+            // upstream, so jump the window forward.
+            (ctr + 1, 0)
+        } else {
+            let bit = 1u128 << offset;
+            if self.recv_window & bit != 0 {
+                return Err(VpnError::Crypto("replayed or reordered counter".into()));
+            }
+            let mut w = self.recv_window | bit;
+            let mut b = self.recv_base;
+            while w & 1 != 0 {
+                w >>= 1;
+                b += 1;
+            }
+            (b, w)
+        };
         let pt = self
             .recv
             .decrypt(&Self::nonce(ctr), ct)
             .map_err(|_| VpnError::Crypto("aes-gcm open failed".into()))?;
-        self.recv_ctr += 1;
+        self.recv_base = next_base;
+        self.recv_window = next_window;
         Ok(pt)
     }
 }
@@ -283,11 +408,13 @@ mod tests {
 
         // Replay is rejected.
         assert!(server.open(&s1).is_err());
-        // Out-of-order (gap) is rejected.
+        // A late packet inside the window is accepted (upstream drops must
+        // not desync the stream), but the duplicate of it is not.
         let s3 = client.seal(&p1).unwrap();
         let s4 = client.seal(&p2).unwrap();
-        assert!(server.open(&s4).is_err());
+        assert_eq!(server.open(&s4).unwrap(), p2);
         assert_eq!(server.open(&s3).unwrap(), p1);
+        assert!(server.open(&s4).is_err());
 
         // Tampering is rejected.
         let mut t = client.seal(&p1).unwrap();
@@ -299,5 +426,63 @@ mod tests {
         let mut other = TunnelCrypto::derive(&secret, &[4u8; 16], Role::Server).unwrap();
         let s = client.seal(&p1).unwrap();
         assert!(other.open(&s).is_err());
+    }
+
+    #[test]
+    fn batch_roundtrip_replay_and_tamper() {
+        let secret = [5u8; 16];
+        let nonce = [8u8; 16];
+        let mut client = TunnelCrypto::derive(&secret, &nonce, Role::Client).unwrap();
+        let mut server = TunnelCrypto::derive(&secret, &nonce, Role::Server).unwrap();
+
+        let pkts: Vec<Vec<u8>> = (0u8..3).map(|i| vec![i; 40 + i as usize]).collect();
+        let sealed = client.seal_batch(&pkts).unwrap();
+        let opened = server.open_batch(&sealed).unwrap();
+        assert_eq!(opened, pkts);
+
+        // Replay of the whole batch is rejected.
+        assert!(server.open_batch(&sealed).is_err());
+        // Tampering is rejected.
+        let mut t = sealed.clone();
+        let last = t.len() - 1;
+        t[last] ^= 0x01;
+        assert!(server.open_batch(&t).is_err());
+
+        // Limits: too many packets / a packet too large for u16 framing.
+        let many: Vec<Vec<u8>> = (0..MAX_BATCH_PKTS + 1)
+            .map(|i| vec![0u8; 10 + i % 5])
+            .collect();
+        assert!(client.seal_batch(&many).is_err());
+        let big = vec![0u8; u16::MAX as usize + 1];
+        assert!(client.seal_batch(&[big]).is_err());
+    }
+
+    #[test]
+    fn counter_gap_from_dropped_packet_is_tolerated() {
+        let secret = [7u8; 16];
+        let nonce = [2u8; 16];
+        let mut client = TunnelCrypto::derive(&secret, &nonce, Role::Client).unwrap();
+        let mut server = TunnelCrypto::derive(&secret, &nonce, Role::Server).unwrap();
+
+        let a = client.seal(&[1]).unwrap();
+        let dropped = client.seal(&[2]).unwrap(); // lost in a full queue
+        let c = client.seal(&[3]).unwrap();
+        assert_eq!(server.open(&a).unwrap(), vec![1]);
+        assert_eq!(server.open(&c).unwrap(), vec![3]);
+        // The stream heals: the next fresh packet is still accepted.
+        let d = client.seal(&[4]).unwrap();
+        assert_eq!(server.open(&d).unwrap(), vec![4]);
+        // A late packet still inside the window is accepted once (it may have
+        // been delayed, not replayed) — and only once.
+        assert_eq!(server.open(&dropped).unwrap(), vec![2]);
+        assert!(server.open(&dropped).is_err());
+    }
+
+    #[test]
+    fn unknown_message_type_is_ignored() {
+        assert!(matches!(
+            decode(&[0xEE, 1, 2, 3]).unwrap(),
+            TunnelMsg::Unknown
+        ));
     }
 }

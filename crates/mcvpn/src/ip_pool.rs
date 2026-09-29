@@ -20,7 +20,7 @@ impl IpPool {
         let prefix: u8 = prefix
             .parse()
             .map_err(|_| VpnError::Device(format!("bad prefix in {cidr}")))?;
-        if prefix > 32 || prefix < 8 {
+        if !(8..=32).contains(&prefix) {
             return Err(VpnError::Device("prefix must be 8..=32".into()));
         }
         let net: Ipv4Addr = net
@@ -59,12 +59,21 @@ impl IpPool {
     }
 
     pub fn contains(&self, ip: Ipv4Addr) -> bool {
-        let mask: u32 = if self.prefix == 0 {
+        (u32::from(ip) & self.mask_u32()) == self.base
+    }
+
+    /// Network address of the pool, as a u32 (for lock-free hot-path checks).
+    pub fn base_u32(&self) -> u32 {
+        self.base
+    }
+
+    /// Netmask of the pool, as a u32.
+    pub fn mask_u32(&self) -> u32 {
+        if self.prefix == 0 {
             0
         } else {
             u32::MAX << (32 - self.prefix)
-        };
-        (u32::from(ip) & mask) == self.base
+        }
     }
 
     pub fn allocate(&mut self) -> Option<Ipv4Addr> {

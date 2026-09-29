@@ -132,6 +132,11 @@ class TunnelService : VpnService() {
             .setMtu(cfg.getInt("mtu"))
             .addAddress(cfg.getString("ip"), cfg.getInt("prefix_len"))
             .addRoute("0.0.0.0", 0)
+            // The tunnel carries IPv4 only, so pull IPv6 into it too: without
+            // this, dual-stack apps leak real IPv6 traffic outside the VPN
+            // while the UI says "connected". Uncarried traffic is dropped and
+            // apps fall back to IPv4 — a leak turned into no connectivity.
+            .addRoute("::", 0)
 
         val dns = cfg.optJSONArray("dns")
         if (dns != null) {

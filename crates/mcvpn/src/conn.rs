@@ -67,6 +67,25 @@ impl Conn {
                 .with_time(Duration::from_secs(30))
                 .with_interval(Duration::from_secs(5)),
         );
+        // One TCP stream carries interactive and bulk traffic together, so a
+        // large send queue turns a bulk transfer into seconds of added delay
+        // for everything behind it (bufferbloat). Keep the unsent queue short:
+        // writers then wait for the socket instead of piling data into it.
+        // Linux/Android only; other platforms have no equivalent knob.
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        {
+            use std::os::fd::AsRawFd;
+            let lowat: libc::c_uint = 32 * 1024;
+            unsafe {
+                libc::setsockopt(
+                    stream.as_raw_fd(),
+                    libc::IPPROTO_TCP,
+                    libc::TCP_NOTSENT_LOWAT,
+                    &lowat as *const _ as *const libc::c_void,
+                    std::mem::size_of::<libc::c_uint>() as libc::socklen_t,
+                );
+            }
+        }
     }
 
     pub fn seed(&mut self, bytes: &[u8]) {
@@ -96,7 +115,9 @@ impl Conn {
             if let Some(body) = self.parser.next_packet(self.threshold)? {
                 return Ok(body);
             }
-            let mut chunk = [0u8; 16384];
+            // 64 KiB per syscall instead of 16 KiB: at bulk rates the read
+            // loop, not the cipher, is what limits the downlink.
+            let mut chunk = [0u8; 65536];
             let n = self.stream.read(&mut chunk).await?;
             if n == 0 {
                 return Err(VpnError::Io(std::io::ErrorKind::UnexpectedEof.into()));
@@ -118,10 +139,24 @@ impl Conn {
         }
     }
 
+    fn encode_into_lvl(&mut self, body: &[u8], out: &mut Vec<u8>, level: u8) {
+        let start = out.len();
+        mc_protocol::frame::encode_frame_into_lvl(body, self.threshold, level, out);
+        if let Some(e) = self.enc.as_mut() {
+            e.process(&mut out[start..]);
+        }
+    }
+
     /// Frame + compress + encrypt + write one packet body.
     pub async fn send(&mut self, body: &[u8]) -> VpnResult<()> {
+        self.send_lvl(body, 6).await
+    }
+
+    /// Same as `send` with an explicit zlib level (wire-invisible: the
+    /// compressed payload lives inside the CFB8 stream).
+    pub async fn send_lvl(&mut self, body: &[u8], level: u8) -> VpnResult<()> {
         let mut frame = Vec::with_capacity(body.len() + 8);
-        self.encode_into(body, &mut frame);
+        self.encode_into_lvl(body, &mut frame, level);
         self.stream.write_all(&frame).await?;
         Ok(())
     }

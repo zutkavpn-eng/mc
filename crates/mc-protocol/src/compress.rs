@@ -6,7 +6,16 @@ use flate2::{read::ZlibDecoder, write::ZlibEncoder, Compression};
 use std::io::{Read, Write};
 
 pub fn deflate(data: &[u8]) -> Vec<u8> {
-    let mut e = ZlibEncoder::new(Vec::with_capacity(data.len() / 2), Compression::new(6));
+    deflate_level(data, 6)
+}
+
+/// Explicit zlib level (wire-invisible: compression happens inside the
+/// encrypted stream; bulk tunnel payloads use a cheaper level).
+pub fn deflate_level(data: &[u8], level: u8) -> Vec<u8> {
+    let mut e = ZlibEncoder::new(
+        Vec::with_capacity(data.len() / 2),
+        Compression::new(level as u32),
+    );
     e.write_all(data).expect("in-memory zlib write");
     e.finish().expect("in-memory zlib finish")
 }

@@ -102,6 +102,11 @@ struct Installed {
 fn remove_routes(state: &Installed, tunnel_gw: &Ipv4Addr, own_ip: &Ipv4Addr) {
     if state.tunnel_routes {
         for net in ["0.0.0.0", "128.0.0.0"] {
+            // Any of the three install paths may have won: delete the
+            // gateway and own-address flavours, plus the bare on-link form
+            // (netsh nexthop=0.0.0.0) that has no gateway at all. Deleting a
+            // route that is not there is a no-op, so this is safe for all.
+            run_quiet("route", &["delete", net, "mask", "128.0.0.0"]);
             run_quiet(
                 "route",
                 &["delete", net, "mask", "128.0.0.0", &tunnel_gw.to_string()],
@@ -385,6 +390,31 @@ pub fn open(info: &TunnelInfo, protect_ip: Option<Ipv4Addr>) -> VpnResult<Device
         cleanup: Some(Box::new(move || {
             let _ = cleanup_session.shutdown();
             remove_routes(&state, &tunnel_gw, &ip);
+            // Leave the host as we found it: a dead adapter must not stay the
+            // preferred resolver (resolution would stall after a disconnect)
+            // nor keep the lowest interface metric.
+            run_quiet(
+                "netsh",
+                &[
+                    "interface",
+                    "ipv4",
+                    "set",
+                    "dnsservers",
+                    ADAPTER_NAME,
+                    "source=dhcp",
+                ],
+            );
+            run_quiet(
+                "netsh",
+                &[
+                    "interface",
+                    "ipv4",
+                    "set",
+                    "interface",
+                    &format!("name={ADAPTER_NAME}"),
+                    "metric=automatic",
+                ],
+            );
         })),
     })
 }
